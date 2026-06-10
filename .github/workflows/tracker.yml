@@ -1,0 +1,39 @@
+name: Polymarket Whale Tracker
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # кожні 5 хвилин
+  workflow_dispatch:          # можливість запустити вручну
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run tracker
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_AMOUNT: ${{ secrets.MIN_AMOUNT }}
+        run: python tracker.py
+
+      - name: Save state to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add last_check.json
+          git diff --cached --quiet || git commit -m "Update last check"
+          git push
