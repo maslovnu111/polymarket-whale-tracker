@@ -30,68 +30,31 @@ def save_state(timestamp):
         json.dump({'last_timestamp': timestamp}, f)
 
 
-def get_trade_ts(trade):
-    """Витягти timestamp угоди в секундах"""
-    for field in ['timestamp', 'match_time', 'created_at', 'blockTimestamp']:
-        val = trade.get(field)
-        if val:
-            try:
-                ts = float(val)
-                if ts > 1e12:
-                    ts /= 1000
-                return ts
-            except Exception:
-                pass
-    return None
-
-
 def get_all_trades(since_timestamp):
-    """
-    Угоди відсортовані від НОВИХ до СТАРИХ.
-    Зупиняємось як тільки зустріли угоду старішу за since_timestamp.
-    Так не вантажимо зайві сторінки.
-    """
     all_trades = []
     offset = 0
     limit = 500
-    page = 0
+    MAX_OFFSET = 3000  # API не приймає більше — зупиняємось тут
 
-    while True:
+    while offset <= MAX_OFFSET:
         params = {
             'limit': limit,
             'offset': offset,
+            'start': since_timestamp,
         }
         try:
             r = requests.get(f"{DATA_API}/trades", params=params, timeout=20)
             r.raise_for_status()
-            batch = r.json()
+            data = r.json()
 
-            if not isinstance(batch, list) or len(batch) == 0:
-                print(f"Порожня відповідь на offset={offset}, зупиняємось")
+            if not isinstance(data, list) or len(data) == 0:
                 break
 
-            new_in_batch = 0
-            stop = False
+            all_trades.extend(data)
+            print(f"offset={offset}: {len(data)} угод (всього: {len(all_trades)})")
 
-            for trade in batch:
-                ts = get_trade_ts(trade)
-                if ts is not None and ts <= since_timestamp:
-                    # Всі наступні угоди ще старіші — зупиняємось
-                    stop = True
-                    break
-                all_trades.append(trade)
-                new_in_batch += 1
-
-            page += 1
-            print(f"Сторінка {page} (offset={offset}): нових угод {new_in_batch} з {len(batch)} (всього: {len(all_trades)})")
-
-            if stop:
-                print("Досягли старих угод — зупиняємось")
-                break
-
-            if len(batch) < limit:
-                print("Остання сторінка")
-                break
+            if len(data) < limit:
+                break  # остання сторінка
 
             offset += limit
             time.sleep(0.3)
@@ -120,9 +83,11 @@ def send_telegram(message):
 
 
 def format_trader(trade):
+    """Ім'я + скорочена адреса, або просто адреса"""
     name = trade.get('name') or trade.get('pseudonym') or ''
     wallet = trade.get('proxyWallet', '')
     short = (wallet[:6] + '...' + wallet[-4:]) if len(wallet) > 10 else wallet
+
     if name.strip():
         return f"{name.strip()} ({short})"
     return short or 'Анонім'
@@ -140,6 +105,7 @@ def format_time(ts_raw):
 
 
 def calc_usd(trade):
+    # Пробуємо готове поле, якщо немає — рахуємо самі
     for field in ['usdcSize', 'cashAmount', 'cash_amount']:
         val = trade.get(field)
         if val:
@@ -160,15 +126,26 @@ def main():
     print(f"Перевірка з {datetime.fromtimestamp(since, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     trades = get_all_trades(since)
-    print(f"Нових угод отримано: {len(trades)}")
+    print(f"Всього угод отримано: {len(trades)}")
 
+    # Відбираємо тільки нові і великі
     big_trades = []
     for trade in trades:
+        try:
+            trade_ts = float(trade.get('timestamp') or 0)
+            if trade_ts > 1e12:
+                trade_ts /= 1000
+        except Exception:
+            trade_ts = 0
+
+        if trade_ts and trade_ts <= since:
+            continue
+
         usd = calc_usd(trade)
         if usd < MIN_AMOUNT:
             continue
-        ts = get_trade_ts(trade) or 0
-        big_trades.append({**trade, '_usd': usd, '_ts': ts})
+
+        big_trades.append({**trade, '_usd': usd, '_ts': trade_ts})
 
     print(f"Великих угод (≥${MIN_AMOUNT:,.0f}): {len(big_trades)}")
 
@@ -177,6 +154,7 @@ def main():
         print("Немає нових великих угод")
         return
 
+    # Групуємо по ринку — одне повідомлення на ринок
     by_market = defaultdict(list)
     for t in big_trades:
         cid = t.get('conditionId', 'unknown')
@@ -186,14 +164,16 @@ def main():
     sent = 0
 
     for cid, market_trades in by_market.items():
+        # Назва і посилання беруться прямо з угоди (не потрібен окремий запит)
         first = market_trades[0]
         title = first.get('title') or first.get('question') or f"ID: {cid[:20]}..."
-        slug = first.get('slug') or first.get('eventSlug') or ''
+        slug = first.get('eventSlug') or first.get('slug') or ''
         market_url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
         total_usd = sum(t['_usd'] for t in market_trades)
         count = len(market_trades)
 
+        # Сортуємо по сумі — найбільші зверху
         market_trades.sort(key=lambda x: x['_usd'], reverse=True)
 
         lines = []
@@ -208,6 +188,7 @@ def main():
             trader = format_trader(t)
             trade_time = format_time(t['_ts'])
             usd = t['_usd']
+
             lines.append(f"{emoji} <b>${usd:,.0f}</b> · {outcome} · {trader} · {trade_time}")
 
         trades_text = "\n".join(lines)
