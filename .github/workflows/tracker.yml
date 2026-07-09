@@ -1,4 +1,7 @@
 name: Polymarket Whale Tracker
+concurrency:
+  group: whale-tracker
+  cancel-in-progress: false
 
 on:
   schedule:
