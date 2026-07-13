@@ -1,12 +1,13 @@
 name: Polymarket Whale Tracker
+
 concurrency:
   group: whale-tracker
   cancel-in-progress: false
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # кожні 5 хвилин
-  workflow_dispatch:          # можливість запустити вручну
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   track:
@@ -33,22 +34,12 @@ jobs:
           MIN_AMOUNT: ${{ secrets.MIN_AMOUNT }}
         run: python tracker.py
 
-            - name: Save state to repo
+      - name: Save state to repo
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add last_check.json
           git diff --cached --quiet && echo "Немає змін" && exit 0
           git commit -m "Update last check"
-          # Кілька спроб push з підтягуванням свіжих змін
-          for i in 1 2 3 4 5; do
-            if git push; then
-              echo "Push успішний"
-              exit 0
-            fi
-            echo "Push відхилено, спроба $i — підтягуємо зміни"
-            git pull --rebase --autostash
-            sleep 2
-          done
-          echo "Не вдалось запушити після 5 спроб"
-          exit 1
+          git pull --rebase --autostash
+          git push
