@@ -12,74 +12,187 @@ MIN_AMOUNT = float(os.environ.get('MIN_AMOUNT', '1000'))
 STATE_FILE = 'last_check.json'
 DATA_API = 'https://data-api.polymarket.com'
 
+# Скільки дивитись назад при першому запуску / скиданні стану (сек)
+LOOKBACK_SECONDS = int(os.environ.get('LOOKBACK_SECONDS', '300'))
+# Якщо стан старіший за це — вважаємо його застарілим і скидаємо (сек)
+STALE_SECONDS = int(os.environ.get('STALE_SECONDS', '3600'))
+
+PAGE_LIMIT = 500
+# Запобіжник від нескінченного циклу: максимум сторінок за один запуск.
+# 200 * 500 = 100 000 угод — з великим запасом на будь-яке 5-хв вікно.
+MAX_PAGES = int(os.environ.get('MAX_PAGES', '200'))
+# Скільки повідомлень максимум слати за один запуск (решта — у зведенні)
+MAX_MESSAGES = int(os.environ.get('MAX_MESSAGES', '30'))
+REQUEST_RETRIES = 3
+REQUEST_TIMEOUT = 20
+
 
 def load_state():
+    now = int(time.time())
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            data = json.load(f)
-            ts = data.get('last_timestamp', 0)
-            if ts == 0 or ts < (int(time.time()) - 3600):
-                print("Timestamp скинуто до 5 хвилин назад")
-                return {'last_timestamp': int(time.time()) - 300}
-            return data
-    return {'last_timestamp': int(time.time()) - 300}
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+            ts = int(data.get('last_timestamp', 0))
+        except Exception as e:
+            print(f"Не вдалося прочитати стан ({e}) — скидаємо")
+            ts = 0
+        if ts == 0 or ts < (now - STALE_SECONDS):
+            print(f"Timestamp скинуто до {LOOKBACK_SECONDS // 60} хвилин назад")
+            return {'last_timestamp': now - LOOKBACK_SECONDS}
+        return {'last_timestamp': ts}
+    return {'last_timestamp': now - LOOKBACK_SECONDS}
 
 
 def save_state(timestamp):
     with open(STATE_FILE, 'w') as f:
-        json.dump({'last_timestamp': timestamp}, f)
+        json.dump({'last_timestamp': int(timestamp)}, f)
 
 
-def get_all_trades(since_timestamp):
-    all_trades = []
-    offset = 0
-    limit = 500
-    MAX_OFFSET = 3000  # API не приймає більше — зупиняємось тут
+def trade_ts(trade):
+    """Час угоди у секундах (Unix). Нормалізуємо мілісекунди -> секунди."""
+    try:
+        ts = float(trade.get('timestamp') or 0)
+        if ts > 1e12:
+            ts /= 1000
+        return ts
+    except Exception:
+        return 0.0
 
-    while offset <= MAX_OFFSET:
-        params = {
-            'limit': limit,
-            'offset': offset,
-            'start': since_timestamp,
-        }
+
+def trade_key(trade):
+    """Унікальний ключ угоди для дедуплікації між сторінками."""
+    return (
+        trade.get('transactionHash'),
+        trade.get('asset') or trade.get('outcomeIndex'),
+        str(trade.get('side')),
+        str(trade.get('size')),
+        str(trade.get('price')),
+        str(trade.get('timestamp')),
+    )
+
+
+def _request_trades(offset, since_timestamp):
+    """Один запит сторінки з ретраями. Кидає виняток, якщо всі спроби невдалі."""
+    params = {
+        'limit': PAGE_LIMIT,
+        'offset': offset,
+        # start ігнорується ендпоінтом, якщо він не підтримує фільтр за часом,
+        # але не шкодить і допомагає, якщо підтримка з'явиться.
+        'start': since_timestamp,
+    }
+    last_err = None
+    for attempt in range(REQUEST_RETRIES):
         try:
-            r = requests.get(f"{DATA_API}/trades", params=params, timeout=20)
+            r = requests.get(f"{DATA_API}/trades", params=params, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             data = r.json()
-
-            if not isinstance(data, list) or len(data) == 0:
-                break
-
-            all_trades.extend(data)
-            print(f"offset={offset}: {len(data)} угод (всього: {len(all_trades)})")
-
-            if len(data) < limit:
-                break  # остання сторінка
-
-            offset += limit
-            time.sleep(0.3)
-
+            if not isinstance(data, list):
+                return []
+            return data
         except Exception as e:
-            print(f"Помилка (offset={offset}): {e}")
+            last_err = e
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"offset={offset}: не вдалося отримати угоди: {last_err}")
+
+
+def get_trades_since(since_timestamp):
+    """
+    Тягне УСІ угоди, новіші за since_timestamp.
+
+    Угоди повертаються від найновіших до найстаріших, тож щойно на сторінці
+    з'являється угода з часом <= since — все далі вже старе, зупиняємось.
+    Так покривається все вікно, скільки б угод там не було, без штучної стелі.
+
+    Повертає (trades, complete): complete=False, якщо покриття неповне
+    (впёрлись у MAX_PAGES або мережева помилка на високому offset).
+    """
+    all_trades = []
+    seen = set()
+    offset = 0
+    pages = 0
+    reached_boundary = False
+    complete = True
+
+    while pages < MAX_PAGES:
+        try:
+            data = _request_trades(offset, since_timestamp)
+        except Exception as e:
+            if offset == 0:
+                # Повний провал фетчу — хай викликач не рухає стан і повторить.
+                raise
+            print(f"⚠️ {e}. Зупиняємось, покриття неповне.")
+            complete = False
             break
 
-    return all_trades
+        if not data:
+            reached_boundary = True
+            break
+
+        page_min_ts = None
+        new_count = 0
+        for t in data:
+            ts = trade_ts(t)
+            if page_min_ts is None or ts < page_min_ts:
+                page_min_ts = ts
+            key = trade_key(t)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_trades.append(t)
+            new_count += 1
+
+        print(f"offset={offset}: {len(data)} угод (нових: {new_count}, всього: {len(all_trades)})")
+
+        # Дійшли до угод, старіших за межу — далі все вже старе.
+        if page_min_ts is not None and page_min_ts <= since_timestamp:
+            reached_boundary = True
+            break
+        # Остання сторінка (даних більше немає).
+        if len(data) < PAGE_LIMIT:
+            reached_boundary = True
+            break
+
+        offset += PAGE_LIMIT
+        pages += 1
+        time.sleep(0.3)
+
+    if pages >= MAX_PAGES and not reached_boundary:
+        complete = False
+        print(f"⚠️ Досягнуто ліміт сторінок ({MAX_PAGES}) — вікно надто велике, "
+              f"частину найстаріших угод могло бути пропущено")
+
+    return all_trades, complete
 
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
-        }, timeout=10)
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"Telegram помилка: {e}")
-        return False
+    for attempt in range(REQUEST_RETRIES):
+        try:
+            r = requests.post(url, json={
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': message,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': False
+            }, timeout=10)
+            if r.status_code == 429:
+                # Telegram rate-limit: чекаємо стільки, скільки просить.
+                retry_after = 1
+                try:
+                    retry_after = int(r.json().get('parameters', {}).get('retry_after', 1))
+                except Exception:
+                    pass
+                print(f"Telegram 429 — чекаємо {retry_after}с")
+                time.sleep(retry_after + 1)
+                continue
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"Telegram помилка (спроба {attempt + 1}): {e}")
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(2 ** attempt)
+    return False
 
 
 def format_trader(trade):
@@ -93,12 +206,9 @@ def format_trader(trade):
     return short or 'Анонім'
 
 
-def format_time(ts_raw):
+def format_time(ts):
     try:
-        ts = float(ts_raw)
-        if ts > 1e12:
-            ts /= 1000
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
         return dt.strftime('%d.%m %H:%M UTC')
     except Exception:
         return '?'
@@ -121,36 +231,34 @@ def calc_usd(trade):
 def main():
     state = load_state()
     since = state['last_timestamp']
-    now = int(time.time())
+    window_end = int(time.time())
 
     print(f"Перевірка з {datetime.fromtimestamp(since, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-    trades = get_all_trades(since)
+    try:
+        trades, complete = get_trades_since(since)
+    except Exception as e:
+        # Не рухаємо стан — наступний запуск повторить те саме вікно.
+        print(f"❌ Помилка отримання угод: {e}. Стан не оновлюється, повторимо наступного разу.")
+        return
+
     print(f"Всього угод отримано: {len(trades)}")
 
-    # Відбираємо тільки нові і великі
+    # Відбираємо тільки угоди у вікні (since, window_end] і достатньо великі.
     big_trades = []
     for trade in trades:
-        try:
-            trade_ts = float(trade.get('timestamp') or 0)
-            if trade_ts > 1e12:
-                trade_ts /= 1000
-        except Exception:
-            trade_ts = 0
-
-        if trade_ts and trade_ts <= since:
+        ts = trade_ts(trade)
+        if ts <= since or ts > window_end:
             continue
-
         usd = calc_usd(trade)
         if usd < MIN_AMOUNT:
             continue
-
-        big_trades.append({**trade, '_usd': usd, '_ts': trade_ts})
+        big_trades.append({**trade, '_usd': usd, '_ts': ts})
 
     print(f"Великих угод (≥${MIN_AMOUNT:,.0f}): {len(big_trades)}")
 
     if not big_trades:
-        save_state(now)
+        save_state(window_end)
         print("Немає нових великих угод")
         return
 
@@ -161,9 +269,16 @@ def main():
         by_market[cid].append(t)
 
     print(f"Ринків з активністю: {len(by_market)}")
-    sent = 0
 
-    for cid, market_trades in by_market.items():
+    # Сортуємо ринки за загальним обсягом — найбільші зверху (важливо при ліміті).
+    markets = sorted(
+        by_market.items(),
+        key=lambda kv: sum(t['_usd'] for t in kv[1]),
+        reverse=True,
+    )
+
+    sent = 0
+    for cid, market_trades in markets[:MAX_MESSAGES]:
         # Назва і посилання беруться прямо з угоди (не потрібен окремий запит)
         first = market_trades[0]
         title = first.get('title') or first.get('question') or f"ID: {cid[:20]}..."
@@ -211,7 +326,23 @@ def main():
 
         time.sleep(0.3)
 
-    save_state(now)
+    # Якщо ринків більше за ліміт — одне зведення, щоб нічого не «зникло тихо».
+    overflow = len(markets) - MAX_MESSAGES
+    if overflow > 0:
+        extra = markets[MAX_MESSAGES:]
+        extra_volume = sum(sum(t['_usd'] for t in mt) for _, mt in extra)
+        send_telegram(
+            f"➕ <b>Ще {overflow} ринків з великою активністю</b>\n"
+            f"💰 Сумарний обсяг: ${extra_volume:,.0f}\n"
+            f"<i>(показано топ-{MAX_MESSAGES} за обсягом)</i>"
+        )
+
+    # Просуваємо стан до кінця вікна. Навіть при неповному покритті рухаємось
+    # вперед — інакше вікно розросталось би й ми повторно слали б сповіщення.
+    # Повний провал фетчу оброблено вище (return без збереження стану).
+    if not complete:
+        print("⚠️ Покриття було неповним — рідкісний найстаріший «хвіст» вікна міг бути пропущений.")
+    save_state(window_end)
     print(f"✅ Готово. Повідомлень надіслано: {sent} (по {len(by_market)} ринках)")
 
 
