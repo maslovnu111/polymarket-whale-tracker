@@ -12,14 +12,23 @@ MIN_AMOUNT = float(os.environ.get('MIN_AMOUNT', '1000'))
 STATE_FILE = 'last_check.json'
 DATA_API = 'https://data-api.polymarket.com'
 
+# Ендпоінт /trades НЕ має фільтра за часом і не віддає більше ~3500 угод
+# (offset обмежений). Тому не намагаємось зчитати весь потік — просимо сервер
+# одразу віддати ЛИШЕ великі угоди (filterType=CASH + filterAmount = мінімум $).
+# Так великі угоди завжди влазять у ліміт, скільки б дрібних не було навколо.
+# Поріг на сервері трохи нижчий за MIN_AMOUNT, щоб не втратити пограничні угоди
+# через можливу різницю в округленні; точний відсів робимо вже в коді.
+FILTER_MARGIN = float(os.environ.get('FILTER_MARGIN', '0.98'))
+FILTER_AMOUNT = max(0, int(MIN_AMOUNT * FILTER_MARGIN))
+
 # Скільки дивитись назад при першому запуску / скиданні стану (сек)
 LOOKBACK_SECONDS = int(os.environ.get('LOOKBACK_SECONDS', '300'))
 # Якщо стан старіший за це — вважаємо його застарілим і скидаємо (сек)
 STALE_SECONDS = int(os.environ.get('STALE_SECONDS', '3600'))
 
 PAGE_LIMIT = 500
-# Запобіжник від нескінченного циклу: максимум сторінок за один запуск.
-# 200 * 500 = 100 000 угод — з великим запасом на будь-яке 5-хв вікно.
+# Запобіжник від нескінченного циклу. Оскільки тягнемо лише ВЕЛИКІ угоди,
+# їх мало — сторінок майже завжди буде 1. 200 — з величезним запасом.
 MAX_PAGES = int(os.environ.get('MAX_PAGES', '200'))
 # Скільки повідомлень максимум слати за один запуск (решта — у зведенні)
 MAX_MESSAGES = int(os.environ.get('MAX_MESSAGES', '30'))
@@ -72,14 +81,14 @@ def trade_key(trade):
     )
 
 
-def _request_trades(offset, since_timestamp):
-    """Один запит сторінки з ретраями. Кидає виняток, якщо всі спроби невдалі."""
+def _request_trades(offset):
+    """Один запит сторінки великих угод з ретраями. Кидає виняток при повній невдачі."""
     params = {
         'limit': PAGE_LIMIT,
         'offset': offset,
-        # start ігнорується ендпоінтом, якщо він не підтримує фільтр за часом,
-        # але не шкодить і допомагає, якщо підтримка з'явиться.
-        'start': since_timestamp,
+        'takerOnly': 'true',       # одна угода = один рядок (без дублів maker/taker)
+        'filterType': 'CASH',      # фільтруємо за грошовим обсягом (USDC)...
+        'filterAmount': FILTER_AMOUNT,  # ...повертаємо лише угоди з сумою >= цього
     }
     last_err = None
     for attempt in range(REQUEST_RETRIES):
@@ -99,14 +108,15 @@ def _request_trades(offset, since_timestamp):
 
 def get_trades_since(since_timestamp):
     """
-    Тягне УСІ угоди, новіші за since_timestamp.
+    Тягне УСІ великі угоди (>= FILTER_AMOUNT), новіші за since_timestamp.
 
-    Угоди повертаються від найновіших до найстаріших, тож щойно на сторінці
-    з'являється угода з часом <= since — все далі вже старе, зупиняємось.
-    Так покривається все вікно, скільки б угод там не було, без штучної стелі.
+    Сервер уже віддає лише великі угоди, тож їх мало. Вони йдуть від найновіших
+    до найстаріших — щойно на сторінці з'являється угода з часом <= since, все
+    далі вже старе, зупиняємось. Оскільки великих угод небагато, межу за часом
+    майже завжди знаходимо на першій сторінці, до жодної стелі offset не доходить.
 
     Повертає (trades, complete): complete=False, якщо покриття неповне
-    (впёрлись у MAX_PAGES або мережева помилка на високому offset).
+    (впёрлись у MAX_PAGES або мережева помилка/offset-ліміт на високому offset).
     """
     all_trades = []
     seen = set()
@@ -117,11 +127,13 @@ def get_trades_since(since_timestamp):
 
     while pages < MAX_PAGES:
         try:
-            data = _request_trades(offset, since_timestamp)
+            data = _request_trades(offset)
         except Exception as e:
             if offset == 0:
                 # Повний провал фетчу — хай викликач не рухає стан і повторить.
                 raise
+            # Помилка на високому offset (напр. offset-ліміт API) — не фатально:
+            # усі найновіші великі угоди ми вже зібрали.
             print(f"⚠️ {e}. Зупиняємось, покриття неповне.")
             complete = False
             break
@@ -143,7 +155,7 @@ def get_trades_since(since_timestamp):
             all_trades.append(t)
             new_count += 1
 
-        print(f"offset={offset}: {len(data)} угод (нових: {new_count}, всього: {len(all_trades)})")
+        print(f"offset={offset}: {len(data)} великих угод (нових: {new_count}, всього: {len(all_trades)})")
 
         # Дійшли до угод, старіших за межу — далі все вже старе.
         if page_min_ts is not None and page_min_ts <= since_timestamp:
@@ -242,9 +254,10 @@ def main():
         print(f"❌ Помилка отримання угод: {e}. Стан не оновлюється, повторимо наступного разу.")
         return
 
-    print(f"Всього угод отримано: {len(trades)}")
+    print(f"Всього великих угод отримано: {len(trades)}")
 
-    # Відбираємо тільки угоди у вікні (since, window_end] і достатньо великі.
+    # Відбираємо тільки угоди у вікні (since, window_end] і точно >= MIN_AMOUNT
+    # (сервер фільтрував за трохи нижчим порогом — тут робимо точний відсів).
     big_trades = []
     for trade in trades:
         ts = trade_ts(trade)
