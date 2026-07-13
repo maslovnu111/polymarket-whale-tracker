@@ -256,6 +256,15 @@ def main():
 
     print(f"Всього великих угод отримано: {len(trades)}")
 
+    # Показуємо, за який реально період API віддав ці угоди (для розуміння —
+    # /trades не має фільтра за часом, тож період не фіксований).
+    ts_list = [trade_ts(t) for t in trades if trade_ts(t) > 0]
+    if ts_list:
+        oldest, newest = min(ts_list), max(ts_list)
+        span_min = (newest - oldest) / 60
+        print(f"Період цих угод: від {format_time(oldest)} до {format_time(newest)} "
+              f"(за ~{span_min:.0f} хв / ~{span_min / 60:.1f} год)")
+
     # Відбираємо тільки угоди у вікні (since, window_end] і точно >= MIN_AMOUNT
     # (сервер фільтрував за трохи нижчим порогом — тут робимо точний відсів).
     big_trades = []
