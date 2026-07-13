@@ -21,10 +21,12 @@ DATA_API = 'https://data-api.polymarket.com'
 FILTER_MARGIN = float(os.environ.get('FILTER_MARGIN', '0.98'))
 FILTER_AMOUNT = max(0, int(MIN_AMOUNT * FILTER_MARGIN))
 
-# Скільки дивитись назад при першому запуску / скиданні стану (сек)
+# Скільки дивитись назад при ПЕРШОМУ запуску (немає збереженого стану), сек
 LOOKBACK_SECONDS = int(os.environ.get('LOOKBACK_SECONDS', '300'))
-# Якщо стан старіший за це — вважаємо його застарілим і скидаємо (сек)
-STALE_SECONDS = int(os.environ.get('STALE_SECONDS', '3600'))
+# Максимальна глибина наздоганяння пропущених запусків, сек (за замовчуванням 24 год).
+# Якщо GitHub пропустив/затримав запуски — добираємо всі угоди з моменту останнього
+# запуску, але не глибше цієї межі (щоб після довгого простою не залити старим).
+MAX_BACKFILL_SECONDS = int(os.environ.get('MAX_BACKFILL_SECONDS', str(24 * 3600)))
 
 PAGE_LIMIT = 500
 # Запобіжник від нескінченного циклу. Оскільки тягнемо лише ВЕЛИКІ угоди,
@@ -38,19 +40,37 @@ REQUEST_TIMEOUT = 20
 
 def load_state():
     now = int(time.time())
+    ts = 0
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
             ts = int(data.get('last_timestamp', 0))
         except Exception as e:
-            print(f"Не вдалося прочитати стан ({e}) — скидаємо")
+            print(f"Не вдалося прочитати стан ({e}) — почнемо з {LOOKBACK_SECONDS // 60} хв назад")
             ts = 0
-        if ts == 0 or ts < (now - STALE_SECONDS):
-            print(f"Timestamp скинуто до {LOOKBACK_SECONDS // 60} хвилин назад")
-            return {'last_timestamp': now - LOOKBACK_SECONDS}
-        return {'last_timestamp': ts}
-    return {'last_timestamp': now - LOOKBACK_SECONDS}
+
+    if ts <= 0:
+        # Немає збереженого стану (перший запуск або пошкоджений файл).
+        since = now - LOOKBACK_SECONDS
+        print(f"Стану немає — дивимось {LOOKBACK_SECONDS // 60} хв назад")
+        return {'last_timestamp': since}
+
+    floor = now - MAX_BACKFILL_SECONDS
+    if ts < floor:
+        # Простій довший за ліміт наздоганяння — беремо лише останні MAX_BACKFILL.
+        gap_h = (now - ts) / 3600
+        print(f"Простій ~{gap_h:.1f} год перевищує ліміт наздоганяння "
+              f"({MAX_BACKFILL_SECONDS // 3600} год) — добираємо лише останні "
+              f"{MAX_BACKFILL_SECONDS // 3600} год")
+        return {'last_timestamp': floor}
+
+    # Нормальний випадок: чесно наздоганяємо ВСЕ з моменту останнього запуску,
+    # навіть якщо GitHub затримав/пропустив кілька слотів — нічого не губимо.
+    gap_min = (now - ts) / 60
+    if gap_min > 6:
+        print(f"Наздоганяємо пропуск ~{gap_min:.0f} хв з моменту останнього запуску")
+    return {'last_timestamp': ts}
 
 
 def save_state(timestamp):
