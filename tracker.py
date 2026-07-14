@@ -3,80 +3,121 @@ import os
 import json
 import time
 from datetime import datetime, timezone
-from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Логіка: ловимо не лише одну велику угоду, а НАКОПИЧЕННЯ позиції китом.
+# Трейдер часто заходить на $1M не разово (немає ліквідності / лімітка), а
+# кількома угодами по ~$200k протягом ~години. Тому:
+#   1. Просимо в сервера лише угоди-кандидати (BUY, сума >= COMPONENT_MIN, напр.
+#      $100k) — їх небагато, вони завжди влазять у ліміт API.
+#   2. Групуємо їх по (гаманець + конкретний результат ринку = asset) і сумуємо
+#      за ковзне вікно AGG_WINDOW (60 хв).
+#   3. Коли сума позиції одного трейдера >= MIN_AMOUNT ($1M) — шлемо сповіщення.
+# Одна велика угода теж спрацьовує — це просто позиція з однієї угоди.
+#
+# Чому це надійно навіть у пік: за один запуск добираємо лише НОВІ угоди з
+# моменту минулого запуску (~5 хв), а 60-хв суму тримаємо у стані між запусками.
+# Щоб пробити ліміт ~3500 угод/запит, потрібно >3500 угод >= COMPONENT_MIN за
+# 5 хв — обсяг, якого фізично не існує.
+# ---------------------------------------------------------------------------
 
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-MIN_AMOUNT = float(os.environ.get('MIN_AMOUNT', '1000'))
 
 STATE_FILE = 'last_check.json'
 DATA_API = 'https://data-api.polymarket.com'
+POLY_EVENT = 'https://polymarket.com/event'
+POLY_PROFILE = 'https://polymarket.com/profile'
+POLYGONSCAN_TX = 'https://polygonscan.com/tx'
 
-# Ендпоінт /trades НЕ має фільтра за часом і не віддає більше ~3500 угод
-# (offset обмежений). Тому не намагаємось зчитати весь потік — просимо сервер
-# одразу віддати ЛИШЕ великі угоди (filterType=CASH + filterAmount = мінімум $).
-# Так великі угоди завжди влазять у ліміт, скільки б дрібних не було навколо.
-# Поріг на сервері трохи нижчий за MIN_AMOUNT, щоб не втратити пограничні угоди
-# через можливу різницю в округленні; точний відсів робимо вже в коді.
-FILTER_MARGIN = float(os.environ.get('FILTER_MARGIN', '0.98'))
-FILTER_AMOUNT = max(0, int(MIN_AMOUNT * FILTER_MARGIN))
 
-# Скільки дивитись назад при ПЕРШОМУ запуску (немає збереженого стану), сек
-LOOKBACK_SECONDS = int(os.environ.get('LOOKBACK_SECONDS', '300'))
-# Максимальна глибина наздоганяння пропущених запусків, сек (за замовчуванням 24 год).
-# Якщо GitHub пропустив/затримав запуски — добираємо всі угоди з моменту останнього
-# запуску, але не глибше цієї межі (щоб після довгого простою не залити старим).
-MAX_BACKFILL_SECONDS = int(os.environ.get('MAX_BACKFILL_SECONDS', str(24 * 3600)))
+def _env_num(name, default, cast=float):
+    """Читає число з env; порожнє/відсутнє/некоректне значення -> default.
+    (Робить безпечним підключення порожніх repo variables у workflow.)"""
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == '':
+        return cast(default)
+    try:
+        return cast(v)
+    except Exception:
+        return cast(default)
+
+
+# Поріг СИГНАЛУ — сумарна позиція трейдера, від якої шлемо сповіщення.
+MIN_AMOUNT = _env_num('MIN_AMOUNT', 1000, float)
+# Поріг ШМАТКА — мінімальна окрема угода, яку рахуємо як частину позиції.
+# Не може бути більшим за MIN_AMOUNT (інакше пропустили б одиничну велику угоду).
+COMPONENT_MIN = min(_env_num('COMPONENT_MIN', 100000, float), MIN_AMOUNT)
+# Вікно агрегації: за який період підсумовуємо угоди одного трейдера (сек).
+AGG_WINDOW_SECONDS = int(_env_num('AGG_WINDOW_MINUTES', 60, float) * 60)
+
+# Серверний поріг трохи нижчий за COMPONENT_MIN — щоб не втратити пограничні
+# шматки через округлення.
+FILTER_MARGIN = _env_num('FILTER_MARGIN', 0.98, float)
+FILTER_AMOUNT = max(0, int(COMPONENT_MIN * FILTER_MARGIN))
+
+# Максимальна глибина наздоганяння пропущених запусків (год -> сек).
+MAX_BACKFILL_SECONDS = int(_env_num('MAX_BACKFILL_HOURS', 24, float) * 3600)
 
 PAGE_LIMIT = 500
-# Запобіжник від нескінченного циклу. Оскільки тягнемо лише ВЕЛИКІ угоди,
-# їх мало — сторінок майже завжди буде 1. 200 — з величезним запасом.
-MAX_PAGES = int(os.environ.get('MAX_PAGES', '200'))
-# Скільки повідомлень максимум слати за один запуск (решта — у зведенні)
-MAX_MESSAGES = int(os.environ.get('MAX_MESSAGES', '30'))
+# Запобіжник від нескінченного циклу (сторінок на запуск). Оскільки за раз
+# добираємо лише ~5 хв угод-кандидатів, реально сторінка майже завжди 1.
+MAX_PAGES = int(_env_num('MAX_PAGES', 200, int))
+# Скільки детальних сповіщень максимум за один запуск (решта — у зведенні).
+MAX_MESSAGES = int(_env_num('MAX_MESSAGES', 30, int))
 REQUEST_RETRIES = 3
 REQUEST_TIMEOUT = 20
 
 
+# ------------------------------- стан --------------------------------------
+
 def load_state():
+    """Повертає {'last_timestamp': since, 'positions': {...}} з наздоганянням
+    пропусків і «прогрівом» вікна, якщо позицій ще немає."""
     now = int(time.time())
     ts = 0
+    positions = {}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
             ts = int(data.get('last_timestamp', 0))
+            positions = data.get('positions', {}) or {}
         except Exception as e:
-            print(f"Не вдалося прочитати стан ({e}) — почнемо з {LOOKBACK_SECONDS // 60} хв назад")
-            ts = 0
-
-    if ts <= 0:
-        # Немає збереженого стану (перший запуск або пошкоджений файл).
-        since = now - LOOKBACK_SECONDS
-        print(f"Стану немає — дивимось {LOOKBACK_SECONDS // 60} хв назад")
-        return {'last_timestamp': since}
+            print(f"Не вдалося прочитати стан ({e}) — починаємо з чистого")
+            ts, positions = 0, {}
 
     floor = now - MAX_BACKFILL_SECONDS
-    if ts < floor:
-        # Простій довший за ліміт наздоганяння — беремо лише останні MAX_BACKFILL.
+    if ts <= 0:
+        since = now - AGG_WINDOW_SECONDS
+        print(f"Стану немає — прогріваємо вікно на {AGG_WINDOW_SECONDS // 60} хв назад")
+    elif ts < floor:
         gap_h = (now - ts) / 3600
         print(f"Простій ~{gap_h:.1f} год перевищує ліміт наздоганяння "
-              f"({MAX_BACKFILL_SECONDS // 3600} год) — добираємо лише останні "
+              f"({MAX_BACKFILL_SECONDS // 3600} год) — беремо лише останні "
               f"{MAX_BACKFILL_SECONDS // 3600} год")
-        return {'last_timestamp': floor}
+        since = floor
+    else:
+        since = ts
+        gap_min = (now - ts) / 60
+        if gap_min > 6:
+            print(f"Наздоганяємо пропуск ~{gap_min:.0f} хв з моменту останнього запуску")
 
-    # Нормальний випадок: чесно наздоганяємо ВСЕ з моменту останнього запуску,
-    # навіть якщо GitHub затримав/пропустив кілька слотів — нічого не губимо.
-    gap_min = (now - ts) / 60
-    if gap_min > 6:
-        print(f"Наздоганяємо пропуск ~{gap_min:.0f} хв з моменту останнього запуску")
-    return {'last_timestamp': ts}
+    # Якщо позицій у стані немає (перший запуск / втрата стану / міграція) —
+    # добираємо одразу цілим вікном, щоб агрегація була коректною з першого разу.
+    if not positions:
+        since = min(since, now - AGG_WINDOW_SECONDS)
+        since = max(since, floor)
+
+    return {'last_timestamp': since, 'positions': positions}
 
 
-def save_state(timestamp):
+def save_state(timestamp, positions):
     with open(STATE_FILE, 'w') as f:
-        json.dump({'last_timestamp': int(timestamp)}, f)
+        json.dump({'last_timestamp': int(timestamp), 'positions': positions}, f)
 
+
+# ------------------------------ утиліти ------------------------------------
 
 def trade_ts(trade):
     """Час угоди у секундах (Unix). Нормалізуємо мілісекунди -> секунди."""
@@ -89,9 +130,9 @@ def trade_ts(trade):
         return 0.0
 
 
-def trade_key(trade):
-    """Унікальний ключ угоди для дедуплікації між сторінками."""
-    return (
+def trade_uid(trade):
+    """Стабільний унікальний ідентифікатор угоди для дедуплікації."""
+    parts = (
         trade.get('transactionHash'),
         trade.get('asset') or trade.get('outcomeIndex'),
         str(trade.get('side')),
@@ -99,16 +140,67 @@ def trade_key(trade):
         str(trade.get('price')),
         str(trade.get('timestamp')),
     )
+    return '|'.join(str(p) for p in parts)
 
+
+def calc_usd(trade):
+    for field in ['usdcSize', 'cashAmount', 'cash_amount']:
+        val = trade.get(field)
+        if val:
+            try:
+                return float(val)
+            except Exception:
+                pass
+    size = float(trade.get('size') or 0)
+    price = float(trade.get('price') or 0)
+    return size * price
+
+
+def outcome_of(trade):
+    o = trade.get('outcome')
+    if o:
+        return str(o)
+    idx = str(trade.get('outcomeIndex', ''))
+    if idx == '1':
+        return 'Yes'
+    if idx == '0':
+        return 'No'
+    return '?'
+
+
+def position_key(trade):
+    """Ключ позиції: гаманець + конкретний результат (asset).
+    Так угоди одного трейдера на одну й ту саму ставку сумуються разом."""
+    wallet = (trade.get('proxyWallet') or '').lower()
+    asset = trade.get('asset')
+    if not asset:
+        asset = f"{trade.get('conditionId')}:{trade.get('outcomeIndex')}"
+    return f"{wallet}|{asset}"
+
+
+def format_time(ts):
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        return dt.strftime('%d.%m %H:%M UTC')
+    except Exception:
+        return '?'
+
+
+def short_wallet(wallet):
+    return (wallet[:6] + '...' + wallet[-4:]) if len(wallet or '') > 10 else (wallet or '')
+
+
+# ------------------------------- API ---------------------------------------
 
 def _request_trades(offset):
-    """Один запит сторінки великих угод з ретраями. Кидає виняток при повній невдачі."""
+    """Одна сторінка угод-кандидатів (BUY, CASH >= FILTER_AMOUNT) з ретраями."""
     params = {
         'limit': PAGE_LIMIT,
         'offset': offset,
-        'takerOnly': 'true',       # одна угода = один рядок (без дублів maker/taker)
-        'filterType': 'CASH',      # фільтруємо за грошовим обсягом (USDC)...
-        'filterAmount': FILTER_AMOUNT,  # ...повертаємо лише угоди з сумою >= цього
+        'takerOnly': 'true',            # одна угода = один рядок
+        'side': 'BUY',                  # лише купівлі (набір позиції)
+        'filterType': 'CASH',           # фільтр за грошовим обсягом (USDC)...
+        'filterAmount': FILTER_AMOUNT,  # ...шматки >= цього порогу
     }
     last_err = None
     for attempt in range(REQUEST_RETRIES):
@@ -127,17 +219,8 @@ def _request_trades(offset):
 
 
 def get_trades_since(since_timestamp):
-    """
-    Тягне УСІ великі угоди (>= FILTER_AMOUNT), новіші за since_timestamp.
-
-    Сервер уже віддає лише великі угоди, тож їх мало. Вони йдуть від найновіших
-    до найстаріших — щойно на сторінці з'являється угода з часом <= since, все
-    далі вже старе, зупиняємось. Оскільки великих угод небагато, межу за часом
-    майже завжди знаходимо на першій сторінці, до жодної стелі offset не доходить.
-
-    Повертає (trades, complete): complete=False, якщо покриття неповне
-    (впёрлись у MAX_PAGES або мережева помилка/offset-ліміт на високому offset).
-    """
+    """Тягне угоди-кандидати, новіші за since_timestamp (від нових до старих,
+    із зупинкою на межі часу). Повертає (trades, complete)."""
     all_trades = []
     seen = set()
     offset = 0
@@ -150,10 +233,7 @@ def get_trades_since(since_timestamp):
             data = _request_trades(offset)
         except Exception as e:
             if offset == 0:
-                # Повний провал фетчу — хай викликач не рухає стан і повторить.
-                raise
-            # Помилка на високому offset (напр. offset-ліміт API) — не фатально:
-            # усі найновіші великі угоди ми вже зібрали.
+                raise  # повний провал — викликач не рухає стан
             print(f"⚠️ {e}. Зупиняємось, покриття неповне.")
             complete = False
             break
@@ -168,20 +248,18 @@ def get_trades_since(since_timestamp):
             ts = trade_ts(t)
             if page_min_ts is None or ts < page_min_ts:
                 page_min_ts = ts
-            key = trade_key(t)
-            if key in seen:
+            uid = trade_uid(t)
+            if uid in seen:
                 continue
-            seen.add(key)
+            seen.add(uid)
             all_trades.append(t)
             new_count += 1
 
-        print(f"offset={offset}: {len(data)} великих угод (нових: {new_count}, всього: {len(all_trades)})")
+        print(f"offset={offset}: {len(data)} угод-кандидатів (нових: {new_count}, всього: {len(all_trades)})")
 
-        # Дійшли до угод, старіших за межу — далі все вже старе.
         if page_min_ts is not None and page_min_ts <= since_timestamp:
             reached_boundary = True
             break
-        # Остання сторінка (даних більше немає).
         if len(data) < PAGE_LIMIT:
             reached_boundary = True
             break
@@ -206,10 +284,9 @@ def send_telegram(message):
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': message,
                 'parse_mode': 'HTML',
-                'disable_web_page_preview': False
+                'disable_web_page_preview': True,
             }, timeout=10)
             if r.status_code == 429:
-                # Telegram rate-limit: чекаємо стільки, скільки просить.
                 retry_after = 1
                 try:
                     retry_after = int(r.json().get('parameters', {}).get('retry_after', 1))
@@ -227,165 +304,178 @@ def send_telegram(message):
     return False
 
 
-def format_trader(trade):
-    """Ім'я + скорочена адреса, або просто адреса"""
-    name = trade.get('name') or trade.get('pseudonym') or ''
-    wallet = trade.get('proxyWallet', '')
-    short = (wallet[:6] + '...' + wallet[-4:]) if len(wallet) > 10 else wallet
+# --------------------------- формування сигналу -----------------------------
 
-    if name.strip():
-        return f"{name.strip()} ({short})"
-    return short or 'Анонім'
+def build_position_message(pos, total, now_ts):
+    title = pos.get('title') or 'Ринок'
+    outcome = pos.get('outcome') or '?'
+    slug = pos.get('slug') or ''
+    event_url = f"{POLY_EVENT}/{slug}" if slug else 'https://polymarket.com'
+    wallet = pos.get('wallet') or ''
+    name = (pos.get('name') or '').strip()
+    short = short_wallet(wallet)
+    trader = f"{name} ({short})" if name else (short or 'Анонім')
+    profile_url = f"{POLY_PROFILE}/{wallet}" if wallet else ''
+
+    trades = pos.get('trades', [])
+    count = len(trades)
+    oldest = min((tr['ts'] for tr in trades), default=now_ts)
+    span_min = max(0, (now_ts - oldest) / 60)
+
+    # Середня ціна, зважена за обсягом.
+    vol = sum(tr['usd'] for tr in trades) or 1
+    avg_price = sum(tr.get('price', 0) * tr['usd'] for tr in trades) / vol
+
+    # Рядки угод (найбільші перші), кожна з посиланням на транзакцію.
+    rows = sorted(trades, key=lambda x: x['usd'], reverse=True)
+    lines = []
+    for tr in rows[:8]:
+        cents = f"{tr.get('price', 0) * 100:.0f}¢" if tr.get('price') else '?'
+        t_time = format_time(tr['ts'])
+        tx = tr.get('tx') or ''
+        base = f"🟢 <b>${tr['usd']:,.0f}</b> · {cents} · {t_time}"
+        if tx:
+            base += f" · <a href='{POLYGONSCAN_TX}/{tx}'>трейд</a>"
+        lines.append(base)
+    trades_text = "\n".join(lines)
+    if count > 8:
+        trades_text += f"\n<i>... і ще {count - 8} угод</i>"
+
+    if count == 1:
+        header = "🐋 <b>Велика ставка кита!</b>"
+    else:
+        header = f"🐋 <b>Кит набирає позицію · {count} угод за {span_min:.0f} хв</b>"
+
+    trader_line = f"👤 <a href='{profile_url}'>{trader}</a>" if profile_url else f"👤 {trader}"
+
+    return (
+        f"{header}\n\n"
+        f"📌 <b>{title}</b>\n"
+        f"🎯 Ставка: <b>{outcome}</b> · середня ціна {avg_price * 100:.0f}¢\n"
+        f"💰 <b>Позиція: ${total:,.0f}</b>" + (f" · {count} угод" if count > 1 else "") + "\n"
+        f"{trader_line}\n\n"
+        f"{trades_text}\n\n"
+        f"🔗 <a href='{event_url}'>Відкрити подію</a>"
+    )
 
 
-def format_time(ts):
-    try:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-        return dt.strftime('%d.%m %H:%M UTC')
-    except Exception:
-        return '?'
-
-
-def calc_usd(trade):
-    # Пробуємо готове поле, якщо немає — рахуємо самі
-    for field in ['usdcSize', 'cashAmount', 'cash_amount']:
-        val = trade.get(field)
-        if val:
-            try:
-                return float(val)
-            except Exception:
-                pass
-    size = float(trade.get('size') or 0)
-    price = float(trade.get('price') or 0)
-    return size * price
-
+# -------------------------------- main -------------------------------------
 
 def main():
     state = load_state()
     since = state['last_timestamp']
+    positions = state['positions']
     window_end = int(time.time())
+    agg_cutoff = window_end - AGG_WINDOW_SECONDS
 
-    print(f"Перевірка з {datetime.fromtimestamp(since, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"Перевірка з {format_time(since)} · поріг сигналу ${MIN_AMOUNT:,.0f} · "
+          f"шматок ≥ ${COMPONENT_MIN:,.0f} · вікно {AGG_WINDOW_SECONDS // 60} хв")
 
     try:
         trades, complete = get_trades_since(since)
     except Exception as e:
-        # Не рухаємо стан — наступний запуск повторить те саме вікно.
         print(f"❌ Помилка отримання угод: {e}. Стан не оновлюється, повторимо наступного разу.")
         return
 
-    print(f"Всього великих угод отримано: {len(trades)}")
+    print(f"Отримано угод-кандидатів: {len(trades)}")
 
-    # Показуємо, за який реально період API віддав ці угоди (для розуміння —
-    # /trades не має фільтра за часом, тож період не фіксований).
-    ts_list = [trade_ts(t) for t in trades if trade_ts(t) > 0]
-    if ts_list:
-        oldest, newest = min(ts_list), max(ts_list)
-        span_min = (newest - oldest) / 60
-        print(f"Період цих угод: від {format_time(oldest)} до {format_time(newest)} "
-              f"(за ~{span_min:.0f} хв / ~{span_min / 60:.1f} год)")
-
-    # Відбираємо тільки угоди у вікні (since, window_end] і точно >= MIN_AMOUNT
-    # (сервер фільтрував за трохи нижчим порогом — тут робимо точний відсів).
-    big_trades = []
-    for trade in trades:
-        ts = trade_ts(trade)
+    # 1) Додаємо нові угоди у відповідні позиції (гаманець + результат).
+    added = 0
+    for t in trades:
+        ts = trade_ts(t)
         if ts <= since or ts > window_end:
             continue
-        usd = calc_usd(trade)
-        if usd < MIN_AMOUNT:
+        if str(t.get('side', 'BUY')).upper() != 'BUY':
             continue
-        big_trades.append({**trade, '_usd': usd, '_ts': ts})
+        usd = calc_usd(t)
+        if usd <= 0:
+            continue
 
-    print(f"Великих угод (≥${MIN_AMOUNT:,.0f}): {len(big_trades)}")
+        key = position_key(t)
+        pos = positions.get(key)
+        if pos is None:
+            pos = {
+                'wallet': t.get('proxyWallet', ''),
+                'asset': str(t.get('asset') or ''),
+                'conditionId': t.get('conditionId', ''),
+                'title': t.get('title') or t.get('question') or '',
+                'slug': t.get('eventSlug') or t.get('slug') or '',
+                'outcome': outcome_of(t),
+                'name': (t.get('name') or t.get('pseudonym') or '').strip(),
+                'alerted': False,
+                'trades': [],
+            }
+            positions[key] = pos
 
-    if not big_trades:
-        save_state(window_end)
-        print("Немає нових великих угод")
-        return
+        uid = trade_uid(t)
+        if any(tr.get('id') == uid for tr in pos['trades']):
+            continue  # вже враховано (перекриття наздоганяння)
 
-    # Групуємо по ринку — одне повідомлення на ринок
-    by_market = defaultdict(list)
-    for t in big_trades:
-        cid = t.get('conditionId', 'unknown')
-        by_market[cid].append(t)
+        pos['trades'].append({
+            'ts': ts,
+            'usd': usd,
+            'price': float(t.get('price') or 0),
+            'tx': t.get('transactionHash') or '',
+            'id': uid,
+        })
+        # Дозаповнюємо метадані, якщо раптом були порожні.
+        if not pos.get('title'):
+            pos['title'] = t.get('title') or t.get('question') or ''
+        if not pos.get('slug'):
+            pos['slug'] = t.get('eventSlug') or t.get('slug') or ''
+        if not pos.get('name'):
+            pos['name'] = (t.get('name') or t.get('pseudonym') or '').strip()
+        added += 1
 
-    print(f"Ринків з активністю: {len(by_market)}")
+    print(f"Додано нових угод у позиції: {added}")
 
-    # Сортуємо ринки за загальним обсягом — найбільші зверху (важливо при ліміті).
-    markets = sorted(
-        by_market.items(),
-        key=lambda kv: sum(t['_usd'] for t in kv[1]),
-        reverse=True,
-    )
+    # 2) Прибираємо угоди поза вікном; чистимо порожні; «озброюємось» знову,
+    #    якщо позиція розсмокталась нижче порогу.
+    for key in list(positions.keys()):
+        pos = positions[key]
+        pos['trades'] = [tr for tr in pos['trades'] if tr['ts'] > agg_cutoff]
+        if not pos['trades']:
+            del positions[key]
+            continue
+        total = sum(tr['usd'] for tr in pos['trades'])
+        if pos.get('alerted') and total < MIN_AMOUNT:
+            pos['alerted'] = False
+
+    # 3) Позиції, що перетнули поріг і ще не просигналені.
+    to_alert = []
+    for key, pos in positions.items():
+        total = sum(tr['usd'] for tr in pos['trades'])
+        if total >= MIN_AMOUNT and not pos.get('alerted'):
+            to_alert.append((pos, total))
+    to_alert.sort(key=lambda x: x[1], reverse=True)
+    print(f"Нових позицій ≥ ${MIN_AMOUNT:,.0f}: {len(to_alert)} · активних позицій у стані: {len(positions)}")
 
     sent = 0
-    for cid, market_trades in markets[:MAX_MESSAGES]:
-        # Назва і посилання беруться прямо з угоди (не потрібен окремий запит)
-        first = market_trades[0]
-        title = first.get('title') or first.get('question') or f"ID: {cid[:20]}..."
-        slug = first.get('eventSlug') or first.get('slug') or ''
-        market_url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
-
-        total_usd = sum(t['_usd'] for t in market_trades)
-        count = len(market_trades)
-
-        # Сортуємо по сумі — найбільші зверху
-        market_trades.sort(key=lambda x: x['_usd'], reverse=True)
-
-        lines = []
-        for t in market_trades[:8]:
-            side = str(t.get('side', 'BUY')).upper()
-            outcome = t.get('outcome') or (
-                'Yes' if str(t.get('outcomeIndex', '')) == '1'
-                else 'No' if str(t.get('outcomeIndex', '')) == '0'
-                else '?'
-            )
-            emoji = "🟢" if side == "BUY" else "🔴"
-            trader = format_trader(t)
-            trade_time = format_time(t['_ts'])
-            usd = t['_usd']
-
-            lines.append(f"{emoji} <b>${usd:,.0f}</b> · {outcome} · {trader} · {trade_time}")
-
-        trades_text = "\n".join(lines)
-        if count > 8:
-            trades_text += f"\n<i>... і ще {count - 8} угод</i>"
-
-        header = "🐋 <b>Велика ставка!</b>" if count == 1 else f"🐋 <b>Активність китів · {count} угод</b>"
-
-        msg = (
-            f"{header}\n\n"
-            f"📌 <b>{title}</b>\n\n"
-            f"{trades_text}\n\n"
-            f"💰 <b>Загальний обсяг: ${total_usd:,.0f}</b>\n"
-            f"🔗 <a href='{market_url}'>Відкрити ринок</a>"
-        )
-
-        if send_telegram(msg):
+    for pos, total in to_alert[:MAX_MESSAGES]:
+        if send_telegram(build_position_message(pos, total, window_end)):
+            pos['alerted'] = True
             sent += 1
-            print(f"✅ {title[:60]} — {count} угод, ${total_usd:,.0f}")
-
+            print(f"✅ {pos.get('title', '')[:50]} · {pos.get('outcome')} · "
+                  f"${total:,.0f} за {len(pos['trades'])} угод")
         time.sleep(0.3)
 
-    # Якщо ринків більше за ліміт — одне зведення, щоб нічого не «зникло тихо».
-    overflow = len(markets) - MAX_MESSAGES
+    # Переповнення (дуже рідко): зведення, щоб нічого не «зникло тихо».
+    overflow = len(to_alert) - MAX_MESSAGES
     if overflow > 0:
-        extra = markets[MAX_MESSAGES:]
-        extra_volume = sum(sum(t['_usd'] for t in mt) for _, mt in extra)
+        extra = to_alert[MAX_MESSAGES:]
+        extra_vol = sum(x[1] for x in extra)
         send_telegram(
-            f"➕ <b>Ще {overflow} ринків з великою активністю</b>\n"
-            f"💰 Сумарний обсяг: ${extra_volume:,.0f}\n"
+            f"➕ <b>Ще {overflow} позицій ≥ ${MIN_AMOUNT:,.0f}</b>\n"
+            f"💰 Сумарно: ${extra_vol:,.0f}\n"
             f"<i>(показано топ-{MAX_MESSAGES} за обсягом)</i>"
         )
+        for pos, _total in extra:
+            pos['alerted'] = True
 
-    # Просуваємо стан до кінця вікна. Навіть при неповному покритті рухаємось
-    # вперед — інакше вікно розросталось би й ми повторно слали б сповіщення.
-    # Повний провал фетчу оброблено вище (return без збереження стану).
     if not complete:
         print("⚠️ Покриття було неповним — рідкісний найстаріший «хвіст» вікна міг бути пропущений.")
-    save_state(window_end)
-    print(f"✅ Готово. Повідомлень надіслано: {sent} (по {len(by_market)} ринках)")
+    save_state(window_end, positions)
+    print(f"✅ Готово. Сповіщень надіслано: {sent}")
 
 
 if __name__ == '__main__':
