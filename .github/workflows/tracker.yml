@@ -32,6 +32,10 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MIN_AMOUNT: ${{ secrets.MIN_AMOUNT }}
+          # Необов'язкові налаштування (Repo Settings -> Secrets and variables ->
+          # Actions -> Variables). Порожні значення = дефолти з коду.
+          COMPONENT_MIN: ${{ vars.COMPONENT_MIN }}         # поріг шматка, $ (деф. 100000)
+          AGG_WINDOW_MINUTES: ${{ vars.AGG_WINDOW_MINUTES }} # вікно агрегації, хв (деф. 60)
         run: python tracker.py
 
       - name: Save state to repo
