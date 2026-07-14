@@ -379,6 +379,22 @@ def main():
 
     print(f"Отримано угод-кандидатів: {len(trades)}")
 
+    # Діагностика: чи є взагалі кандидати у вікні, і чи не відкидаємо їх помилково.
+    if trades:
+        ts_all = [trade_ts(t) for t in trades]
+        newest, oldest = max(ts_all), min(ts_all)
+        in_window = sum(1 for ts in ts_all if since < ts <= window_end)
+        future = sum(1 for ts in ts_all if ts > window_end)
+        before = sum(1 for ts in ts_all if ts <= since)
+        biggest = max(trades, key=calc_usd)
+        print(f"Діапазон кандидатів: {format_time(oldest)} .. {format_time(newest)} "
+              f"(це найновіші {len(trades)} купівель ≥ ${FILTER_AMOUNT:,.0f})")
+        print(f"У вікні ({format_time(since)}..зараз): {in_window} · "
+              f"до вікна: {before} · у майбутньому (розсинхрон годинника): {future}")
+        print(f"Найбільша у вибірці: ${calc_usd(biggest):,.0f} о {format_time(trade_ts(biggest))}")
+        if in_window == 0 and future == 0:
+            print("→ У цьому вікні великих купівель не було (тихий період) — це нормально.")
+
     # 1) Додаємо нові угоди у відповідні позиції (гаманець + результат).
     added = 0
     for t in trades:
