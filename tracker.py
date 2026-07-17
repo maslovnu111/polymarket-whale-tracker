@@ -1,7 +1,10 @@
 import requests
 import os
+import re
 import json
 import time
+import html
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -13,6 +16,8 @@ from datetime import datetime, timezone
 #   2. Групуємо їх по (гаманець + конкретний результат ринку = asset) і сумуємо
 #      за ковзне вікно AGG_WINDOW (60 хв).
 #   3. Коли сума позиції одного трейдера >= MIN_AMOUNT ($1M) — шлемо сповіщення.
+#      Повторно та сама позиція сигналить лише коли зросла у ESCALATE_FACTOR
+#      разів від уже просигналеної суми (захист від дублів на межі порогу).
 # Одна велика угода теж спрацьовує — це просто позиція з однієї угоди.
 #
 # Чому це надійно навіть у пік: за один запуск добираємо лише НОВІ угоди з
@@ -21,8 +26,10 @@ from datetime import datetime, timezone
 # 5 хв — обсяг, якого фізично не існує.
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise SystemExit("❌ Не задано TELEGRAM_TOKEN / TELEGRAM_CHAT_ID (Secrets репозиторію)")
 
 STATE_FILE = 'last_check.json'
 DATA_API = 'https://data-api.polymarket.com'
@@ -40,31 +47,47 @@ def _env_num(name, default, cast=float):
     try:
         return cast(v)
     except Exception:
+        print(f"⚠️ {name}={v!r} — не число, використовую default {default}")
         return cast(default)
 
 
+def _clamp(val, lo, hi, name):
+    if val < lo or val > hi:
+        fixed = min(max(val, lo), hi)
+        print(f"⚠️ {name}={val} поза межами [{lo}..{hi}] — використовую {fixed}")
+        return fixed
+    return val
+
+
 # Поріг СИГНАЛУ — сумарна позиція трейдера, від якої шлемо сповіщення.
-MIN_AMOUNT = _env_num('MIN_AMOUNT', 1000, float)
+MIN_AMOUNT = _clamp(_env_num('MIN_AMOUNT', 1_000_000, float), 1_000, 1e12, 'MIN_AMOUNT')
 # Поріг ШМАТКА — мінімальна окрема угода, яку рахуємо як частину позиції.
-# Не може бути більшим за MIN_AMOUNT (інакше пропустили б одиничну велику угоду).
-COMPONENT_MIN = min(_env_num('COMPONENT_MIN', 100000, float), MIN_AMOUNT)
+# Не вище MIN_AMOUNT (інакше пропустили б одиничну велику угоду) і не нижче
+# $1000 (інакше кандидатів стане забагато і впремося в ліміт API).
+COMPONENT_MIN = _clamp(_env_num('COMPONENT_MIN', 100_000, float), 1_000, MIN_AMOUNT, 'COMPONENT_MIN')
 # Вікно агрегації: за який період підсумовуємо угоди одного трейдера (сек).
-AGG_WINDOW_SECONDS = int(_env_num('AGG_WINDOW_MINUTES', 60, float) * 60)
+AGG_WINDOW_SECONDS = int(_clamp(_env_num('AGG_WINDOW_MINUTES', 60, float), 5, 24 * 60, 'AGG_WINDOW_MINUTES') * 60)
+# Повторний сигнал по вже просигналеній позиції — лише якщо вона зросла у
+# стільки разів (захист від дублів, коли сума коливається біля порогу).
+ESCALATE_FACTOR = _clamp(_env_num('ESCALATE_FACTOR', 2.0, float), 1.2, 100, 'ESCALATE_FACTOR')
 
 # Серверний поріг трохи нижчий за COMPONENT_MIN — щоб не втратити пограничні
 # шматки через округлення.
-FILTER_MARGIN = _env_num('FILTER_MARGIN', 0.98, float)
-FILTER_AMOUNT = max(0, int(COMPONENT_MIN * FILTER_MARGIN))
+FILTER_MARGIN = _clamp(_env_num('FILTER_MARGIN', 0.98, float), 0.5, 1.0, 'FILTER_MARGIN')
+FILTER_AMOUNT = max(1, int(COMPONENT_MIN * FILTER_MARGIN))
 
 # Максимальна глибина наздоганяння пропущених запусків (год -> сек).
 MAX_BACKFILL_SECONDS = int(_env_num('MAX_BACKFILL_HOURS', 24, float) * 3600)
+MAX_BACKFILL_SECONDS = max(MAX_BACKFILL_SECONDS, AGG_WINDOW_SECONDS)
 
 PAGE_LIMIT = 500
 # Запобіжник від нескінченного циклу (сторінок на запуск). Оскільки за раз
 # добираємо лише ~5 хв угод-кандидатів, реально сторінка майже завжди 1.
-MAX_PAGES = int(_env_num('MAX_PAGES', 200, int))
+MAX_PAGES = max(1, int(_env_num('MAX_PAGES', 200, int)))
 # Скільки детальних сповіщень максимум за один запуск (решта — у зведенні).
-MAX_MESSAGES = int(_env_num('MAX_MESSAGES', 30, int))
+MAX_MESSAGES = max(1, int(_env_num('MAX_MESSAGES', 30, int)))
+# Стеля кількості позицій у стані (страховка від патологічного розростання).
+MAX_POSITIONS = 3000
 REQUEST_RETRIES = 3
 REQUEST_TIMEOUT = 20
 
@@ -73,7 +96,7 @@ REQUEST_TIMEOUT = 20
 
 def load_state():
     """Повертає {'last_timestamp': since, 'positions': {...}} з наздоганянням
-    пропусків і «прогрівом» вікна, якщо позицій ще немає."""
+    пропусків. Прогрів на повне вікно — лише коли стану немає взагалі."""
     now = int(time.time())
     ts = 0
     positions = {}
@@ -83,6 +106,8 @@ def load_state():
                 data = json.load(f)
             ts = int(data.get('last_timestamp', 0))
             positions = data.get('positions', {}) or {}
+            if not isinstance(positions, dict):
+                positions = {}
         except Exception as e:
             print(f"Не вдалося прочитати стан ({e}) — починаємо з чистого")
             ts, positions = 0, {}
@@ -103,12 +128,6 @@ def load_state():
         if gap_min > 6:
             print(f"Наздоганяємо пропуск ~{gap_min:.0f} хв з моменту останнього запуску")
 
-    # Якщо позицій у стані немає (перший запуск / втрата стану / міграція) —
-    # добираємо одразу цілим вікном, щоб агрегація була коректною з першого разу.
-    if not positions:
-        since = min(since, now - AGG_WINDOW_SECONDS)
-        since = max(since, floor)
-
     return {'last_timestamp': since, 'positions': positions}
 
 
@@ -118,6 +137,12 @@ def save_state(timestamp, positions):
 
 
 # ------------------------------ утиліти ------------------------------------
+
+def esc(s):
+    """Екранування для Telegram HTML: <, >, &, лапки. Без цього назва ринку
+    на кшталт 'BTC <$95k?' ламає парсинг і сповіщення губиться."""
+    return html.escape(str(s), quote=True)
+
 
 def trade_ts(trade):
     """Час угоди у секундах (Unix). Нормалізуємо мілісекунди -> секунди."""
@@ -151,9 +176,12 @@ def calc_usd(trade):
                 return float(val)
             except Exception:
                 pass
-    size = float(trade.get('size') or 0)
-    price = float(trade.get('price') or 0)
-    return size * price
+    try:
+        size = float(trade.get('size') or 0)
+        price = float(trade.get('price') or 0)
+        return size * price
+    except Exception:
+        return 0.0
 
 
 def outcome_of(trade):
@@ -178,6 +206,10 @@ def position_key(trade):
     return f"{wallet}|{asset}"
 
 
+def pos_total(pos):
+    return sum(tr['usd'] for tr in pos.get('trades', []))
+
+
 def format_time(ts):
     try:
         dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
@@ -193,7 +225,9 @@ def short_wallet(wallet):
 # ------------------------------- API ---------------------------------------
 
 def _request_trades(offset):
-    """Одна сторінка угод-кандидатів (BUY, CASH >= FILTER_AMOUNT) з ретраями."""
+    """Одна сторінка угод-кандидатів (BUY, CASH >= FILTER_AMOUNT) з ретраями.
+    Не-список у відповіді — це помилка (а не «угод немає»), інакше можна
+    мовчки просунути стан і назавжди втратити вікно."""
     params = {
         'limit': PAGE_LIMIT,
         'offset': offset,
@@ -209,7 +243,7 @@ def _request_trades(offset):
             r.raise_for_status()
             data = r.json()
             if not isinstance(data, list):
-                return []
+                raise ValueError(f"неочікувана відповідь API: {str(data)[:200]}")
             return data
         except Exception as e:
             last_err = e
@@ -239,6 +273,10 @@ def get_trades_since(since_timestamp):
             break
 
         if not data:
+            if offset == 0:
+                # Угоди ≥ $98k існують завжди — порожня ПЕРША сторінка означає
+                # збій API. Не рухаємо стан, наступний запуск наздожене.
+                raise RuntimeError("API повернув порожню першу сторінку — підозріло")
             reached_boundary = True
             break
 
@@ -277,6 +315,9 @@ def get_trades_since(since_timestamp):
 
 
 def send_telegram(message):
+    """Надсилає HTML-повідомлення. 429 — чекаємо і повторюємо; 400 (постійна
+    помилка розмітки) — надсилаємо plain-text без розмітки, щоб сигнал не
+    загубився; мережеві збої — ретраї з backoff."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(REQUEST_RETRIES):
         try:
@@ -295,6 +336,23 @@ def send_telegram(message):
                 print(f"Telegram 429 — чекаємо {retry_after}с")
                 time.sleep(retry_after + 1)
                 continue
+            if r.status_code == 400:
+                # Постійна помилка (найчастіше розмітка) — ретраїти marно.
+                try:
+                    desc = r.json().get('description', '')
+                except Exception:
+                    desc = r.text[:200]
+                print(f"Telegram 400 ({desc}) — пробую без розмітки")
+                plain = html.unescape(re.sub(r'<[^>]+>', '', message))
+                r2 = requests.post(url, json={
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'text': plain,
+                    'disable_web_page_preview': True,
+                }, timeout=10)
+                if r2.status_code == 200:
+                    return True
+                print(f"Telegram plain-text теж відхилено: {r2.status_code} {r2.text[:200]}")
+                return False
             r.raise_for_status()
             return True
         except Exception as e:
@@ -306,16 +364,16 @@ def send_telegram(message):
 
 # --------------------------- формування сигналу -----------------------------
 
-def build_position_message(pos, total, now_ts):
-    title = pos.get('title') or 'Ринок'
-    outcome = pos.get('outcome') or '?'
+def build_position_message(pos, total, now_ts, prev_alerted_usd=0):
+    title = esc(pos.get('title') or 'Ринок')
+    outcome = esc(pos.get('outcome') or '?')
     slug = pos.get('slug') or ''
-    event_url = f"{POLY_EVENT}/{slug}" if slug else 'https://polymarket.com'
+    event_url = f"{POLY_EVENT}/{quote(str(slug), safe='-_/')}" if slug else 'https://polymarket.com'
     wallet = pos.get('wallet') or ''
     name = (pos.get('name') or '').strip()
     short = short_wallet(wallet)
-    trader = f"{name} ({short})" if name else (short or 'Анонім')
-    profile_url = f"{POLY_PROFILE}/{wallet}" if wallet else ''
+    trader = esc(f"{name} ({short})" if name else (short or 'Анонім'))
+    profile_url = f"{POLY_PROFILE}/{quote(str(wallet), safe='')}" if wallet else ''
 
     trades = pos.get('trades', [])
     count = len(trades)
@@ -332,21 +390,25 @@ def build_position_message(pos, total, now_ts):
     for tr in rows[:8]:
         cents = f"{tr.get('price', 0) * 100:.0f}¢" if tr.get('price') else '?'
         t_time = format_time(tr['ts'])
-        tx = tr.get('tx') or ''
+        tx = str(tr.get('tx') or '')
         base = f"🟢 <b>${tr['usd']:,.0f}</b> · {cents} · {t_time}"
         if tx:
-            base += f" · <a href='{POLYGONSCAN_TX}/{tx}'>трейд</a>"
+            base += f" · <a href=\"{POLYGONSCAN_TX}/{quote(tx, safe='')}\">трейд</a>"
         lines.append(base)
     trades_text = "\n".join(lines)
     if count > 8:
         trades_text += f"\n<i>... і ще {count - 8} угод</i>"
 
-    if count == 1:
+    if prev_alerted_usd > 0:
+        header = (f"🐋 <b>Кит збільшив позицію до ${total:,.0f}</b> "
+                  f"(було ${prev_alerted_usd:,.0f})")
+    elif count == 1:
         header = "🐋 <b>Велика ставка кита!</b>"
     else:
         header = f"🐋 <b>Кит набирає позицію · {count} угод за {span_min:.0f} хв</b>"
 
-    trader_line = f"👤 <a href='{profile_url}'>{trader}</a>" if profile_url else f"👤 {trader}"
+    trader_line = (f"👤 <a href=\"{esc(profile_url)}\">{trader}</a>"
+                   if profile_url else f"👤 {trader}")
 
     return (
         f"{header}\n\n"
@@ -355,7 +417,7 @@ def build_position_message(pos, total, now_ts):
         f"💰 <b>Позиція: ${total:,.0f}</b>" + (f" · {count} угод" if count > 1 else "") + "\n"
         f"{trader_line}\n\n"
         f"{trades_text}\n\n"
-        f"🔗 <a href='{event_url}'>Відкрити подію</a>"
+        f"🔗 <a href=\"{esc(event_url)}\">Відкрити подію</a>"
     )
 
 
@@ -418,7 +480,7 @@ def main():
                 'slug': t.get('eventSlug') or t.get('slug') or '',
                 'outcome': outcome_of(t),
                 'name': (t.get('name') or t.get('pseudonym') or '').strip(),
-                'alerted': False,
+                'alerted_usd': 0,
                 'trades': [],
             }
             positions[key] = pos
@@ -445,34 +507,48 @@ def main():
 
     print(f"Додано нових угод у позиції: {added}")
 
-    # 2) Прибираємо угоди поза вікном; чистимо порожні; «озброюємось» знову,
-    #    якщо позиція розсмокталась нижче порогу.
+    # 2) Прибираємо угоди поза вікном; чистимо порожні позиції; міграція
+    #    старого формату (alerted: bool -> alerted_usd: сума на момент сигналу).
+    #    ВАЖЛИВО: alerted_usd НЕ скидається, коли сума тимчасово падає нижче
+    #    порогу (старі угоди виходять з вікна) — інакше одна нова угода знову
+    #    піднімала б суму над порогом і летів би дубль-сигнал про ту саму
+    #    позицію. Нова «серія» починається лише коли позиція повністю зникла.
     for key in list(positions.keys()):
         pos = positions[key]
-        pos['trades'] = [tr for tr in pos['trades'] if tr['ts'] > agg_cutoff]
+        pos['trades'] = [tr for tr in pos['trades'] if tr.get('ts', 0) > agg_cutoff]
         if not pos['trades']:
             del positions[key]
             continue
-        total = sum(tr['usd'] for tr in pos['trades'])
-        if pos.get('alerted') and total < MIN_AMOUNT:
-            pos['alerted'] = False
+        if 'alerted_usd' not in pos:
+            pos['alerted_usd'] = pos_total(pos) if pos.pop('alerted', False) else 0
+        pos.pop('alerted', None)
 
-    # 3) Позиції, що перетнули поріг і ще не просигналені.
+    # Страховка від патологічного розростання стану.
+    if len(positions) > MAX_POSITIONS:
+        keep = sorted(positions.items(), key=lambda kv: pos_total(kv[1]), reverse=True)
+        dropped = len(positions) - MAX_POSITIONS
+        positions = dict(keep[:MAX_POSITIONS])
+        print(f"⚠️ Позицій забагато — лишаю топ-{MAX_POSITIONS} за обсягом, відкинуто {dropped}")
+
+    # 3) Позиції для сигналу: перетнули поріг уперше, або зросли у
+    #    ESCALATE_FACTOR разів від уже просигналеної суми.
     to_alert = []
     for key, pos in positions.items():
-        total = sum(tr['usd'] for tr in pos['trades'])
-        if total >= MIN_AMOUNT and not pos.get('alerted'):
-            to_alert.append((pos, total))
+        total = pos_total(pos)
+        prev = float(pos.get('alerted_usd') or 0)
+        if total >= MIN_AMOUNT and (prev <= 0 or total >= prev * ESCALATE_FACTOR):
+            to_alert.append((pos, total, prev))
     to_alert.sort(key=lambda x: x[1], reverse=True)
     print(f"Нових позицій ≥ ${MIN_AMOUNT:,.0f}: {len(to_alert)} · активних позицій у стані: {len(positions)}")
 
     sent = 0
-    for pos, total in to_alert[:MAX_MESSAGES]:
-        if send_telegram(build_position_message(pos, total, window_end)):
-            pos['alerted'] = True
+    for pos, total, prev in to_alert[:MAX_MESSAGES]:
+        if send_telegram(build_position_message(pos, total, window_end, prev)):
+            pos['alerted_usd'] = total
             sent += 1
             print(f"✅ {pos.get('title', '')[:50]} · {pos.get('outcome')} · "
-                  f"${total:,.0f} за {len(pos['trades'])} угод")
+                  f"${total:,.0f} за {len(pos['trades'])} угод"
+                  + (f" (ескалація з ${prev:,.0f})" if prev > 0 else ""))
         time.sleep(0.3)
 
     # Переповнення (дуже рідко): зведення, щоб нічого не «зникло тихо».
@@ -485,12 +561,17 @@ def main():
             f"💰 Сумарно: ${extra_vol:,.0f}\n"
             f"<i>(показано топ-{MAX_MESSAGES} за обсягом)</i>"
         )
-        for pos, _total in extra:
-            pos['alerted'] = True
+        for pos, total, _prev in extra:
+            pos['alerted_usd'] = total
 
-    if not complete:
-        print("⚠️ Покриття було неповним — рідкісний найстаріший «хвіст» вікна міг бути пропущений.")
-    save_state(window_end, positions)
+    # Стан просуваємо лише при повному покритті вікна. При неповному лишаємо
+    # since на місці: наступний запуск перечитає вікно, а дублі виключені
+    # (угоди — через uid, сигнали — через alerted_usd).
+    if complete:
+        save_state(window_end, positions)
+    else:
+        save_state(since, positions)
+        print("⚠️ Покриття було неповним — стан не просунуто, наступний запуск доробить вікно.")
     print(f"✅ Готово. Сповіщень надіслано: {sent}")
 
 

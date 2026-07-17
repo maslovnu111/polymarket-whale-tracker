@@ -12,6 +12,8 @@ on:
 jobs:
   track:
     runs-on: ubuntu-latest
+    # Страховка: завислий запуск не блокує чергу наступних.
+    timeout-minutes: 10
     permissions:
       contents: write
 
