@@ -42,8 +42,37 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add last_check.json
-          git diff --cached --quiet && echo "Немає змін" && exit 0
-          git commit -m "Update last check"
-          git pull --rebase --autostash
-          git push
+
+          # tracker.py щойно оновив last_check.json у робочій копії.
+          if git diff --quiet -- last_check.json; then
+            echo "Стан не змінився — нічого зберігати"
+            exit 0
+          fi
+
+          # last_check.json — згенерований файл стану: найновіша версія завжди
+          # правильна. Тому НЕ робимо rebase (він конфліктує), а на кожній гонці
+          # просто перезаписуємо файл нашою свіжою версією і повторюємо push.
+          cp last_check.json /tmp/state.json
+
+          for i in 1 2 3 4 5; do
+            git fetch origin main || true
+            git reset --hard origin/main         # чиста копія найновішого main
+            cp /tmp/state.json last_check.json   # накладаємо наш свіжий стан
+            git add last_check.json
+            if git diff --cached --quiet; then
+              echo "Стан уже актуальний на origin — пушити нічого"
+              exit 0
+            fi
+            git commit -m "Update last check"
+            if git push origin HEAD:main; then
+              echo "Стан збережено"
+              exit 0
+            fi
+            echo "Гонка при push (спроба $i) — оновлюю main і повторюю"
+            sleep $((RANDOM % 5 + 3))
+          done
+
+          # НЕ валимо джобу, щоб не приходив лист про помилку. Наступний запуск
+          # наздожене пропущене вікно через last_timestamp.
+          echo "::warning::Не вдалося зберегти стан після 5 спроб — наступний запуск наздожене"
+          exit 0
