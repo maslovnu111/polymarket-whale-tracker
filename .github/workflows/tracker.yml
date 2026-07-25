@@ -38,8 +38,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      # Залежностей немає — tracker.py працює на стандартній бібліотеці Python.
+      # Це прибрало крок `pip install` (мережева операція на кожному запуску,
+      # ще одна причина падінь) і скоротило час запуску.
 
       - name: Run tracker
         env:
