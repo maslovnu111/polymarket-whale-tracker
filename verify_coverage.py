@@ -122,9 +122,14 @@ for k, v in multi.items():
 print(f"\n[2] ПОДВІЙНИЙ РАХУНОК при takerOnly=false:")
 print(f"    груп з кількома рядками на один tx: {len(multi)}")
 print(f"    з них підозра «агрегат + його ж частини»: {len(aggregate_dupes)}")
+taker_uids = {uid(t) for t in taker}
 if aggregate_dupes:
-    for k, s in aggregate_dupes[:5]:
-        print(f"      tx={str(k[0])[:16]}.. суми={[f'{x:,.0f}' for x in s]}")
+    for k, s in aggregate_dupes[:3]:
+        print(f"\n      РОЗБІР tx={k[0]}")
+        for x in multi[k]:
+            print(f"        ${usd_of(x):>11,.0f} size={x.get('size')} price={x.get('price')} "
+                  f"ts={int(ts_of(x))} у_taker_вибірці={'ТАК' if uid(x) in taker_uids else 'НІ'}")
+        print(f"        поля рядка: {sorted(multi[k][0].keys())}")
 else:
     print("    -> дублів немає: це часткові виконання, їх ТРЕБА сумувати")
     for k, v in list(multi.items())[:3]:
