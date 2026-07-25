@@ -1,10 +1,11 @@
-import requests
 import os
 import re
 import json
 import time
 import html
-from urllib.parse import quote
+import urllib.request
+import urllib.error
+from urllib.parse import quote, urlencode
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -237,6 +238,35 @@ def short_wallet(wallet):
     return (wallet[:6] + '...' + wallet[-4:]) if len(wallet or '') > 10 else (wallet or '')
 
 
+# ------------------------------- HTTP --------------------------------------
+
+def http_json(url, params=None, payload=None, timeout=None):
+    """GET (з params) або POST JSON (payload). Повертає (status, data).
+
+    Свідомо на стандартній бібліотеці, без `requests`: інакше кожен запуск
+    мусив би тягнути пакет з PyPI — зайва мережева операція 288 разів на добу
+    і ще одна причина, через яку запуск може впасти.
+    """
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    data = None
+    headers = {'User-Agent': 'polymarket-whale-tracker', 'Accept': 'application/json'}
+    if payload is not None:
+        data = json.dumps(payload).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or REQUEST_TIMEOUT) as r:
+            status, body = r.status, r.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx: тіло теж потрібне (429 -> retry_after, 400 -> опис помилки)
+        status, body = e.code, e.read().decode('utf-8', 'replace')
+    try:
+        return status, json.loads(body)
+    except Exception:
+        return status, body
+
+
 # ------------------------------- API ---------------------------------------
 
 def _request_trades(offset):
@@ -254,9 +284,9 @@ def _request_trades(offset):
     last_err = None
     for attempt in range(REQUEST_RETRIES):
         try:
-            r = requests.get(f"{DATA_API}/trades", params=params, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
+            status, data = http_json(f"{DATA_API}/trades", params=params)
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}: {str(data)[:200]}")
             if not isinstance(data, list):
                 raise ValueError(f"неочікувана відповідь API: {str(data)[:200]}")
             return data
@@ -336,39 +366,37 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(REQUEST_RETRIES):
         try:
-            r = requests.post(url, json={
+            status, data = http_json(url, payload={
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': message,
                 'parse_mode': 'HTML',
                 'disable_web_page_preview': True,
             }, timeout=10)
-            if r.status_code == 429:
+            if status == 429:
                 retry_after = 1
                 try:
-                    retry_after = int(r.json().get('parameters', {}).get('retry_after', 1))
+                    retry_after = int(data.get('parameters', {}).get('retry_after', 1))
                 except Exception:
                     pass
                 print(f"Telegram 429 — чекаємо {retry_after}с")
                 time.sleep(retry_after + 1)
                 continue
-            if r.status_code == 400:
-                # Постійна помилка (найчастіше розмітка) — ретраїти marно.
-                try:
-                    desc = r.json().get('description', '')
-                except Exception:
-                    desc = r.text[:200]
+            if status == 400:
+                # Постійна помилка (найчастіше розмітка) — ретраїти марно.
+                desc = data.get('description', '') if isinstance(data, dict) else str(data)[:200]
                 print(f"Telegram 400 ({desc}) — пробую без розмітки")
                 plain = html.unescape(re.sub(r'<[^>]+>', '', message))
-                r2 = requests.post(url, json={
+                status2, data2 = http_json(url, payload={
                     'chat_id': TELEGRAM_CHAT_ID,
                     'text': plain,
                     'disable_web_page_preview': True,
                 }, timeout=10)
-                if r2.status_code == 200:
+                if status2 == 200:
                     return True
-                print(f"Telegram plain-text теж відхилено: {r2.status_code} {r2.text[:200]}")
+                print(f"Telegram plain-text теж відхилено: {status2} {str(data2)[:200]}")
                 return False
-            r.raise_for_status()
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}: {str(data)[:200]}")
             return True
         except Exception as e:
             print(f"Telegram помилка (спроба {attempt + 1}): {e}")
