@@ -127,14 +127,39 @@ TRANSFER_SINGLE = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2
 TRANSFER_BATCH = '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb'
 
 
-def onchain_received(tx_hash, wallet, asset_id):
-    """Скільки токенів asset_id реально отримав wallet у цій транзакції (ERC-1155)."""
+RPCS = [
+    'https://polygon.llamarpc.com',
+    'https://polygon.drpc.org',
+    'https://1rpc.io/matic',
+    'https://polygon-bor-rpc.publicnode.com',
+    'https://rpc.ankr.com/polygon',
+    'https://polygon-rpc.com',
+]
+
+
+def fetch_receipt(tx_hash):
     body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getTransactionReceipt',
                        'params': [tx_hash]}).encode()
-    req = urllib.request.Request('https://polygon-rpc.com', data=body,
-                                 headers={'Content-Type': 'application/json', 'User-Agent': 'verify'})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        rc = json.loads(r.read().decode()).get('result') or {}
+    last = None
+    for url in RPCS:
+        try:
+            req = urllib.request.Request(url, data=body,
+                                         headers={'Content-Type': 'application/json',
+                                                  'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                res = json.loads(r.read().decode())
+            if res.get('result'):
+                print(f"        (RPC: {url})")
+                return res['result']
+            last = res.get('error')
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"жоден RPC не відповів: {last}")
+
+
+def onchain_received(tx_hash, wallet, asset_id):
+    """Скільки токенів asset_id реально отримав wallet у цій транзакції (ERC-1155)."""
+    rc = fetch_receipt(tx_hash) or {}
     w = wallet.lower().replace('0x', '').rjust(64, '0')
     total = 0
     for log in rc.get('logs', []):
