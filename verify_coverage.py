@@ -123,13 +123,71 @@ print(f"\n[2] ПОДВІЙНИЙ РАХУНОК при takerOnly=false:")
 print(f"    груп з кількома рядками на один tx: {len(multi)}")
 print(f"    з них підозра «агрегат + його ж частини»: {len(aggregate_dupes)}")
 taker_uids = {uid(t) for t in taker}
+TRANSFER_SINGLE = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62'
+TRANSFER_BATCH = '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb'
+
+
+def onchain_received(tx_hash, wallet, asset_id):
+    """Скільки токенів asset_id реально отримав wallet у цій транзакції (ERC-1155)."""
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getTransactionReceipt',
+                       'params': [tx_hash]}).encode()
+    req = urllib.request.Request('https://polygon-rpc.com', data=body,
+                                 headers={'Content-Type': 'application/json', 'User-Agent': 'verify'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        rc = json.loads(r.read().decode()).get('result') or {}
+    w = wallet.lower().replace('0x', '').rjust(64, '0')
+    total = 0
+    for log in rc.get('logs', []):
+        topics = log.get('topics', [])
+        if not topics:
+            continue
+        data = log.get('data', '0x')[2:]
+        if topics[0].lower() == TRANSFER_SINGLE and len(topics) >= 4:
+            if topics[3][2:].lower() != w:
+                continue
+            tid, val = int(data[0:64], 16), int(data[64:128], 16)
+            if str(tid) == str(asset_id):
+                total += val
+        elif topics[0].lower() == TRANSFER_BATCH and len(topics) >= 4:
+            if topics[3][2:].lower() != w:
+                continue
+            # data: offset ids, offset vals, len ids, ids..., len vals, vals...
+            words = [data[i:i + 64] for i in range(0, len(data), 64)]
+            try:
+                n = int(words[2], 16)
+                ids = [int(words[3 + i], 16) for i in range(n)]
+                vals = [int(words[4 + n + i], 16) for i in range(n)]
+                for tid, val in zip(ids, vals):
+                    if str(tid) == str(asset_id):
+                        total += val
+            except Exception:
+                pass
+    return total
+
+
 if aggregate_dupes:
     for k, s in aggregate_dupes[:3]:
-        print(f"\n      РОЗБІР tx={k[0]}")
+        tx, wallet, asset = k
+        print(f"\n      РОЗБІР tx={tx}")
+        print(f"      гаманець={wallet}")
         for x in multi[k]:
             print(f"        ${usd_of(x):>11,.0f} size={x.get('size')} price={x.get('price')} "
                   f"ts={int(ts_of(x))} у_taker_вибірці={'ТАК' if uid(x) in taker_uids else 'НІ'}")
-        print(f"        поля рядка: {sorted(multi[k][0].keys())}")
+        rows_sum = sum(float(x.get('size') or 0) for x in multi[k])
+        largest = max(float(x.get('size') or 0) for x in multi[k])
+        try:
+            got = onchain_received(tx, wallet, asset)
+            print(f"\n        ОНЧЕЙН отримано токенів: {got:,}")
+            print(f"        сума всіх рядків:        {rows_sum:,.0f}")
+            print(f"        найбільший рядок:        {largest:,.0f}")
+            if abs(got - rows_sum) <= max(1, rows_sum * 0.001):
+                print("        ВИСНОВОК: рядки НЕ дублюються — сумувати ПРАВИЛЬНО")
+            elif abs(got - largest) <= max(1, largest * 0.001):
+                print("        ВИСНОВОК: це АГРЕГАТ + його частини — буде подвійний рахунок!")
+            else:
+                print("        ВИСНОВОК: не збігається ні з чим — потрібен ручний розбір")
+        except Exception as e:
+            print(f"        ончейн-перевірка не вдалася: {e}")
 else:
     print("    -> дублів немає: це часткові виконання, їх ТРЕБА сумувати")
     for k, v in list(multi.items())[:3]:
