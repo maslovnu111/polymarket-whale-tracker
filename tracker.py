@@ -95,6 +95,14 @@ STATE_HEARTBEAT_SECONDS = int(_clamp(_env_num('STATE_HEARTBEAT_MINUTES', 30, flo
 MIN_RUN_INTERVAL_SECONDS = int(_clamp(_env_num('MIN_RUN_INTERVAL_SECONDS', 45, float),
                                       0, 240, 'MIN_RUN_INTERVAL_SECONDS'))
 
+# Бюджет часу на вибірку угод (сек). Джоба вбивається таймаутом за 4 хв, і
+# смерть посеред вибірки — найгірший сценарій: сповіщення не надсилаються
+# взагалі, стан не зберігається, наступний запуск повторює те саме вікно і
+# може обірватись знову. Тому зупиняємось САМІ й обробляємо те, що встигли:
+# сигнали йдуть, межа вікна не просувається, наступний запуск доробить.
+FETCH_BUDGET_SECONDS = int(_clamp(_env_num('FETCH_BUDGET_SECONDS', 90, float),
+                                  10, 180, 'FETCH_BUDGET_SECONDS'))
+
 PAGE_LIMIT = 500
 # Запобіжник від нескінченного циклу (сторінок на запуск). Оскільки за раз
 # добираємо лише ~5 хв угод-кандидатів, реально сторінка майже завжди 1.
@@ -326,8 +334,15 @@ def get_trades_since(since_timestamp, taker_only=False):
     pages = 0
     reached_boundary = False
     complete = True
+    started = time.time()
 
     while pages < MAX_PAGES:
+        if pages and (time.time() - started) > FETCH_BUDGET_SECONDS:
+            complete = False
+            print(f"⚠️ Вибірка триває довше за {FETCH_BUDGET_SECONDS}с — зупиняємось самі, "
+                  f"щоб не потрапити під таймаут джоби. Обробимо {len(all_trades)} угод, "
+                  f"решту добере наступний запуск.")
+            break
         try:
             data = _request_trades(offset, taker_only)
         except Exception as e:
