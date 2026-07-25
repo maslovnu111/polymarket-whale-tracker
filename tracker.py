@@ -172,9 +172,18 @@ def trade_ts(trade):
 
 
 def trade_uid(trade):
-    """Стабільний унікальний ідентифікатор угоди для дедуплікації."""
+    """Стабільний унікальний ідентифікатор угоди для дедуплікації.
+
+    Хеш транзакції у реальних даних є завжди; якщо його раптом немає, самих
+    лише суми/ціни/часу замало — дві різні угоди могли б злитися в одну і
+    частина позиції загубилася б. Тому підставляємо гаманець і ринок.
+    Для угод із хешем формат не змінюється — старі записи стану лишаються
+    чинними і нічого не задвоюється."""
+    tx = trade.get('transactionHash')
+    if not tx:
+        tx = f"notx:{trade.get('proxyWallet')}:{trade.get('conditionId')}"
     parts = (
-        trade.get('transactionHash'),
+        tx,
         trade.get('asset') or trade.get('outcomeIndex'),
         str(trade.get('side')),
         str(trade.get('size')),
@@ -613,6 +622,7 @@ def main():
     #    порогу (старі угоди виходять з вікна) — інакше одна нова угода знову
     #    піднімала б суму над порогом і летів би дубль-сигнал про ту саму
     #    позицію. Нова «серія» починається лише коли позиція повністю зникла.
+    stale_alerts = 0
     for key in list(positions.keys()):
         pos = positions[key]
         pos['trades'] = [tr for tr in pos['trades'] if tr.get('ts', 0) > agg_cutoff]
@@ -622,6 +632,16 @@ def main():
         if 'alerted_usd' not in pos:
             pos['alerted_usd'] = pos_total(pos) if pos.pop('alerted', False) else 0
         pos.pop('alerted', None)
+        # Сповіщення записане за НИЖЧОГО порога (напр. під час тестів) більше
+        # не має сенсу: за нинішнім порогом воно б не відбулося. Такі позначки
+        # лише тримають стан «просигналеним» і змушують коміт на кожен запуск.
+        if 0 < float(pos.get('alerted_usd') or 0) < MIN_AMOUNT:
+            pos['alerted_usd'] = 0
+            stale_alerts += 1
+
+    if stale_alerts:
+        print(f"Очищено застарілих позначок про сповіщення: {stale_alerts} "
+              f"(записані за нижчого порога)")
 
     # Страховка від патологічного розростання стану.
     if len(positions) > MAX_POSITIONS:
@@ -656,13 +676,19 @@ def main():
     if overflow > 0:
         extra = to_alert[MAX_MESSAGES:]
         extra_vol = sum(x[1] for x in extra)
-        send_telegram(
+        # Позначати позиції просигналеними можна ЛИШЕ якщо зведення дійшло.
+        # Інакше вони мовчки випали б назавжди: до сповіщення не потрапили і в
+        # to_alert більше не повертаються.
+        if send_telegram(
             f"➕ <b>Ще {overflow} позицій ≥ ${MIN_AMOUNT:,.0f}</b>\n"
             f"💰 Сумарно: ${extra_vol:,.0f}\n"
             f"<i>(показано топ-{MAX_MESSAGES} за обсягом)</i>"
-        )
-        for pos, total, _prev in extra:
-            pos['alerted_usd'] = total
+        ):
+            for pos, total, _prev in extra:
+                pos['alerted_usd'] = total
+        else:
+            print(f"⚠️ Зведення про {overflow} позицій не надіслано — "
+                  f"не позначаємо їх, спробуємо наступного запуску")
 
     # --- Чи треба взагалі чіпати файл стану? ---
     # Обов'язково зберігаємо, якщо: стану ще немає; щойно надіслали сповіщення
@@ -673,7 +699,10 @@ def main():
     # самого last_timestamp і відновить позиції з угод.
     has_alerted = any(float(p.get('alerted_usd') or 0) > 0 for p in positions.values())
     heartbeat_due = (window_end - stored_ts) >= STATE_HEARTBEAT_SECONDS
-    must_save = (stored_ts <= 0) or sent > 0 or has_alerted or heartbeat_due
+    # stale_alerts: чистка сталася лише в пам'яті — без запису файл лишався б
+    # засміченим назавжди, і кожен запуск чистив би те саме наново.
+    must_save = ((stored_ts <= 0) or sent > 0 or has_alerted
+                 or heartbeat_due or stale_alerts > 0)
 
     if not complete:
         # Неповне покриття: не просуваємо межу вікна, наступний запуск доробить.
@@ -684,7 +713,8 @@ def main():
         save_state(window_end, positions)
         why = ("сповіщення" if sent > 0 else
                "є просигналені позиції" if has_alerted else
-               "серцебиття" if heartbeat_due else "перший запуск")
+               "серцебиття" if heartbeat_due else
+               "чистка застарілих позначок" if stale_alerts else "перший запуск")
         print(f"Стан збережено ({why})")
     else:
         quiet_min = (window_end - stored_ts) / 60
