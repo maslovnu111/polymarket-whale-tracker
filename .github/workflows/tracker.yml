@@ -2,18 +2,30 @@ name: Polymarket Whale Tracker
 
 concurrency:
   group: whale-tracker
+  # Не скасовуємо запуск на льоту: він може саме надсилати сповіщення.
+  # Черга не накопичується, бо тригер один і запуск обмежений таймаутом.
   cancel-in-progress: false
 
 on:
+  # ОСНОВНИЙ тригер — зовнішній планувальник (cron-job.org) через
+  # workflow_dispatch кожні 5 хв.
+  #
+  # Розклад нижче — лише СТРАХОВКА на випадок, якщо зовнішній планувальник
+  # замовкне. Він навмисно рідкісний і зміщений з 5-хвилинної сітки (:07/:37),
+  # щоб не збігатися із зовнішніми запусками: раніше тут стояло '*/5', обидва
+  # джерела стріляли одночасно, запуски ставали в чергу concurrency-групи і
+  # при будь-якій затримці GitHub каскадом скасовувались («No jobs were run»)
+  # або падали зі «Startup failure».
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 jobs:
   track:
     runs-on: ubuntu-latest
-    # Страховка: завислий запуск не блокує чергу наступних.
-    timeout-minutes: 10
+    # Завислий запуск має звільнити concurrency-групу ШВИДШЕ, ніж прийде
+    # наступний (кожні 5 хв), інакше черга росте і запуски скасовуються.
+    timeout-minutes: 4
     permissions:
       contents: write
 
@@ -56,8 +68,10 @@ jobs:
           # просто перезаписуємо файл нашою свіжою версією і повторюємо push.
           cp last_check.json /tmp/state.json
 
-          for i in 1 2 3 4 5; do
-            git fetch origin main || true
+          # timeout на мережевих операціях: зависла git-команда не має тримати
+          # весь запуск (і concurrency-групу разом з ним).
+          for i in 1 2 3; do
+            timeout 60 git fetch origin main || true
             git reset --hard origin/main         # чиста копія найновішого main
             cp /tmp/state.json last_check.json   # накладаємо наш свіжий стан
             git add last_check.json
@@ -66,7 +80,7 @@ jobs:
               exit 0
             fi
             git commit -m "Update last check"
-            if git push origin HEAD:main; then
+            if timeout 60 git push origin HEAD:main; then
               echo "Стан збережено"
               exit 0
             fi
@@ -76,5 +90,5 @@ jobs:
 
           # НЕ валимо джобу, щоб не приходив лист про помилку. Наступний запуск
           # наздожене пропущене вікно через last_timestamp.
-          echo "::warning::Не вдалося зберегти стан після 5 спроб — наступний запуск наздожене"
+          echo "::warning::Не вдалося зберегти стан після 3 спроб — наступний запуск наздожене"
           exit 0

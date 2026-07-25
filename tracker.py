@@ -80,6 +80,20 @@ FILTER_AMOUNT = max(1, int(COMPONENT_MIN * FILTER_MARGIN))
 MAX_BACKFILL_SECONDS = int(_env_num('MAX_BACKFILL_HOURS', 24, float) * 3600)
 MAX_BACKFILL_SECONDS = max(MAX_BACKFILL_SECONDS, AGG_WINDOW_SECONDS)
 
+# Як часто ОБОВ'ЯЗКОВО просувати збережений стан, навіть якщо нічого не
+# сталося (сек). Між цими «серцебиттями» тихий запуск не чіпає файл стану —
+# отже workflow не робить коміт. Це прибирає ~5-хвилинну комітну «молотилку»
+# (репозиторій уже має тисячі комітів «Update last check») і разом з нею —
+# гонки при push. Нічого не губиться: незмінений last_timestamp означає, що
+# наступний запуск просто перечитає те саме вікно, а дублі виключені
+# (угоди — за uid, сповіщення — за alerted_usd).
+STATE_HEARTBEAT_SECONDS = int(_clamp(_env_num('STATE_HEARTBEAT_MINUTES', 30, float),
+                                     1, 240, 'STATE_HEARTBEAT_MINUTES') * 60)
+# Захист від дублюючих тригерів (зовнішній планувальник + розклад GitHub +
+# ручний запуск): якщо стан збережено щойно, повторний запуск нічого не дасть.
+MIN_RUN_INTERVAL_SECONDS = int(_clamp(_env_num('MIN_RUN_INTERVAL_SECONDS', 45, float),
+                                      0, 240, 'MIN_RUN_INTERVAL_SECONDS'))
+
 PAGE_LIMIT = 500
 # Запобіжник від нескінченного циклу (сторінок на запуск). Оскільки за раз
 # добираємо лише ~5 хв угод-кандидатів, реально сторінка майже завжди 1.
@@ -95,8 +109,9 @@ REQUEST_TIMEOUT = 20
 # ------------------------------- стан --------------------------------------
 
 def load_state():
-    """Повертає {'last_timestamp': since, 'positions': {...}} з наздоганянням
-    пропусків. Прогрів на повне вікно — лише коли стану немає взагалі."""
+    """Повертає {'last_timestamp': since, 'stored_ts': ts, 'positions': {...}}
+    з наздоганянням пропусків. `stored_ts` — те, що реально лежить у файлі
+    (0 = стану немає); `since` — звідки читати цього разу."""
     now = int(time.time())
     ts = 0
     positions = {}
@@ -125,10 +140,10 @@ def load_state():
     else:
         since = ts
         gap_min = (now - ts) / 60
-        if gap_min > 6:
+        if gap_min > (STATE_HEARTBEAT_SECONDS / 60 + 6):
             print(f"Наздоганяємо пропуск ~{gap_min:.0f} хв з моменту останнього запуску")
 
-    return {'last_timestamp': since, 'positions': positions}
+    return {'last_timestamp': since, 'stored_ts': ts, 'positions': positions}
 
 
 def save_state(timestamp, positions):
@@ -426,9 +441,18 @@ def build_position_message(pos, total, now_ts, prev_alerted_usd=0):
 def main():
     state = load_state()
     since = state['last_timestamp']
+    stored_ts = state['stored_ts']
     positions = state['positions']
     window_end = int(time.time())
     agg_cutoff = window_end - AGG_WINDOW_SECONDS
+
+    # Дублюючий тригер (зовнішній планувальник + розклад GitHub + ручний
+    # запуск) — стан збережено щойно, робити нічого. Виходимо одразу, щоб не
+    # займати concurrency-групу і не смикати API.
+    if 0 < stored_ts and (window_end - stored_ts) < MIN_RUN_INTERVAL_SECONDS:
+        print(f"Стан оновлено {window_end - stored_ts}с тому "
+              f"(< {MIN_RUN_INTERVAL_SECONDS}с) — дублюючий запуск, виходимо")
+        return
 
     print(f"Перевірка з {format_time(since)} · поріг сигналу ${MIN_AMOUNT:,.0f} · "
           f"шматок ≥ ${COMPONENT_MIN:,.0f} · вікно {AGG_WINDOW_SECONDS // 60} хв")
@@ -564,14 +588,34 @@ def main():
         for pos, total, _prev in extra:
             pos['alerted_usd'] = total
 
-    # Стан просуваємо лише при повному покритті вікна. При неповному лишаємо
-    # since на місці: наступний запуск перечитає вікно, а дублі виключені
-    # (угоди — через uid, сигнали — через alerted_usd).
-    if complete:
-        save_state(window_end, positions)
-    else:
-        save_state(since, positions)
+    # --- Чи треба взагалі чіпати файл стану? ---
+    # Обов'язково зберігаємо, якщо: стану ще немає; щойно надіслали сповіщення
+    # або в стані є вже просигналені позиції (це єдине, що НЕ відновлюється
+    # перечитуванням — інакше сповіщення продублюється); або настав час
+    # «серцебиття». В усіх інших випадках файл не чіпаємо — тоді workflow не
+    # робить коміт, а наступний запуск просто перечитає те саме вікно з того
+    # самого last_timestamp і відновить позиції з угод.
+    has_alerted = any(float(p.get('alerted_usd') or 0) > 0 for p in positions.values())
+    heartbeat_due = (window_end - stored_ts) >= STATE_HEARTBEAT_SECONDS
+    must_save = (stored_ts <= 0) or sent > 0 or has_alerted or heartbeat_due
+
+    if not complete:
+        # Неповне покриття: не просуваємо межу вікна, наступний запуск доробить.
+        if must_save:
+            save_state(stored_ts if stored_ts > 0 else since, positions)
         print("⚠️ Покриття було неповним — стан не просунуто, наступний запуск доробить вікно.")
+    elif must_save:
+        save_state(window_end, positions)
+        why = ("сповіщення" if sent > 0 else
+               "є просигналені позиції" if has_alerted else
+               "серцебиття" if heartbeat_due else "перший запуск")
+        print(f"Стан збережено ({why})")
+    else:
+        quiet_min = (window_end - stored_ts) / 60
+        print(f"Стан не змінюємо (тихо {quiet_min:.0f} хв, наступне збереження "
+              f"через ~{(STATE_HEARTBEAT_SECONDS - (window_end - stored_ts)) / 60:.0f} хв) "
+              f"— коміт не потрібен")
+
     print(f"✅ Готово. Сповіщень надіслано: {sent}")
 
 
