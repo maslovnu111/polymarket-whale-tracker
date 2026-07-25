@@ -269,24 +269,25 @@ def http_json(url, params=None, payload=None, timeout=None):
 
 # ------------------------------- API ---------------------------------------
 
-def _request_trades(offset):
+def _request_trades(offset, taker_only=False):
     """Одна сторінка угод-кандидатів (BUY, CASH >= FILTER_AMOUNT) з ретраями.
     Не-список у відповіді — це помилка (а не «угод немає»), інакше можна
     мовчки просунути стан і назавжди втратити вікно."""
     params = {
         'limit': PAGE_LIMIT,
         'offset': offset,
-        # ОБОВ'ЯЗКОВО false. За замовчуванням API віддає ЛИШЕ ордери тейкера
-        # («Flag that determines whether to return only taker orders. Defaults
-        # to true»), тобто ховає всі виконання лімітних ордерів, де кит —
-        # мейкер. А кит саме так і заходить на великі суми: ставить лімітку,
-        # бо в книзі немає ліквідності на разовий ринковий ордер.
-        # Заміри на живих даних: при true не було видно навіть одиничних
-        # купівель на $1.99M і $1.65M.
-        # Подвійного рахунку це не створює: фільтр side=BUY лишає один рядок
+        # За замовчуванням API віддає ЛИШЕ ордери тейкера («Flag that determines
+        # whether to return only taker orders. Defaults to true»), тобто ховає
+        # всі виконання лімітних ордерів, де кит — мейкер. А кит саме так і
+        # заходить на великі суми: ставить лімітку, бо в книзі немає ліквідності
+        # на разовий ринковий ордер. Заміри на живих даних: при true не було
+        # видно навіть одиничних купівель на $1.99M і $1.65M.
+        # Подвійного рахунку false не створює: фільтр side=BUY лишає один рядок
         # на кожне виконання з боку покупця, а кілька рядків на один tx — це
         # часткові виконання одного ордера, які й треба підсумувати.
-        'takerOnly': 'false',
+        # taker_only=True використовується ОКРЕМО — щоб визначити, яка угода
+        # була ринковою, а яка лімітною (у відповіді немає такого поля).
+        'takerOnly': 'true' if taker_only else 'false',
         'side': 'BUY',                  # лише купівлі (набір позиції)
         'filterType': 'CASH',           # фільтр за грошовим обсягом (USDC)...
         'filterAmount': FILTER_AMOUNT,  # ...шматки >= цього порогу
@@ -307,7 +308,7 @@ def _request_trades(offset):
     raise RuntimeError(f"offset={offset}: не вдалося отримати угоди: {last_err}")
 
 
-def get_trades_since(since_timestamp):
+def get_trades_since(since_timestamp, taker_only=False):
     """Тягне угоди-кандидати, новіші за since_timestamp (від нових до старих,
     із зупинкою на межі часу). Повертає (trades, complete)."""
     all_trades = []
@@ -319,7 +320,7 @@ def get_trades_since(since_timestamp):
 
     while pages < MAX_PAGES:
         try:
-            data = _request_trades(offset)
+            data = _request_trades(offset, taker_only)
         except Exception as e:
             if offset == 0:
                 raise  # повний провал — викликач не рухає стан
@@ -417,6 +418,10 @@ def send_telegram(message):
 
 # --------------------------- формування сигналу -----------------------------
 
+# Як підписувати тип кожної угоди у сповіщенні.
+KIND_LABEL = {'market': '⚡ маркет', 'limit': '📘 лімітка'}
+
+
 def build_position_message(pos, total, now_ts, prev_alerted_usd=0):
     title = esc(pos.get('title') or 'Ринок')
     outcome = esc(pos.get('outcome') or '?')
@@ -444,13 +449,27 @@ def build_position_message(pos, total, now_ts, prev_alerted_usd=0):
         cents = f"{tr.get('price', 0) * 100:.0f}¢" if tr.get('price') else '?'
         t_time = format_time(tr['ts'])
         tx = str(tr.get('tx') or '')
-        base = f"🟢 <b>${tr['usd']:,.0f}</b> · {cents} · {t_time}"
+        kind = KIND_LABEL.get(tr.get('kind'), '')
+        base = f"🟢 <b>${tr['usd']:,.0f}</b> · {cents}"
+        if kind:
+            base += f" · {kind}"
+        base += f" · {t_time}"
         if tx:
             base += f" · <a href=\"{POLYGONSCAN_TX}/{quote(tx, safe='')}\">трейд</a>"
         lines.append(base)
     trades_text = "\n".join(lines)
     if count > 8:
         trades_text += f"\n<i>... і ще {count - 8} угод</i>"
+
+    # Підсумок: яка частина позиції набрана ринковими ордерами, яка лімітками.
+    by_market = sum(tr['usd'] for tr in trades if tr.get('kind') == 'market')
+    by_limit = sum(tr['usd'] for tr in trades if tr.get('kind') == 'limit')
+    mix_parts = []
+    if by_market:
+        mix_parts.append(f"⚡ маркет ${by_market:,.0f}")
+    if by_limit:
+        mix_parts.append(f"📘 лімітки ${by_limit:,.0f}")
+    mix_line = f"🧩 Набрано: {' · '.join(mix_parts)}\n" if mix_parts else ""
 
     if prev_alerted_usd > 0:
         header = (f"🐋 <b>Кит збільшив позицію до ${total:,.0f}</b> "
@@ -468,6 +487,7 @@ def build_position_message(pos, total, now_ts, prev_alerted_usd=0):
         f"📌 <b>{title}</b>\n"
         f"🎯 Ставка: <b>{outcome}</b> · середня ціна {avg_price * 100:.0f}¢\n"
         f"💰 <b>Позиція: ${total:,.0f}</b>" + (f" · {count} угод" if count > 1 else "") + "\n"
+        f"{mix_line}"
         f"{trader_line}\n\n"
         f"{trades_text}\n\n"
         f"🔗 <a href=\"{esc(event_url)}\">Відкрити подію</a>"
@@ -519,6 +539,21 @@ def main():
         if in_window == 0 and future == 0:
             print("→ У цьому вікні великих купівель не було (тихий період) — це нормально.")
 
+    # Визначаємо тип кожної угоди: ринкова (тейкер) чи лімітка (мейкер).
+    # У відповіді API такого поля немає, тож беремо ту саму вибірку з
+    # takerOnly=true: що потрапило туди — ринкове, решта — лімітки.
+    # Робимо це ЛИШЕ якщо у вікні взагалі є нові угоди, щоб тихі запуски
+    # не витрачали зайвий запит. Якщо не вдалося — не біда: сповіщення
+    # піде без мітки типу, а не зникне.
+    taker_uids = None
+    if any(since < trade_ts(t) <= window_end for t in trades):
+        try:
+            taker_trades, _tc = get_trades_since(since, taker_only=True)
+            taker_uids = {trade_uid(t) for t in taker_trades}
+            print(f"Тип угод визначено (ринкових у вибірці: {len(taker_uids)})")
+        except Exception as e:
+            print(f"⚠️ Не вдалося визначити тип угод ({e}) — сповіщення буде без міток")
+
     # 1) Додаємо нові угоди у відповідні позиції (гаманець + результат).
     added = 0
     for t in trades:
@@ -557,6 +592,9 @@ def main():
             'price': float(t.get('price') or 0),
             'tx': t.get('transactionHash') or '',
             'id': uid,
+            # market = ринковий ордер (тейкер), limit = лімітка (мейкер),
+            # '' = визначити не вдалося.
+            'kind': '' if taker_uids is None else ('market' if uid in taker_uids else 'limit'),
         })
         # Дозаповнюємо метадані, якщо раптом були порожні.
         if not pos.get('title'):
