@@ -379,7 +379,34 @@ def get_trades_since(since_timestamp, taker_only=False):
     return all_trades, complete
 
 
+TELEGRAM_MAX_CHARS = 4096
+
+
+def clip_message(message, limit=TELEGRAM_MAX_CHARS - 120):
+    """Обрізає надто довге повідомлення, щоб Telegram не відхилив його з 400.
+
+    Типове сповіщення ~1800 символів, але аномально довга назва ринку може
+    вийти за ліміт 4096 — і сигнал тоді просто не дійде. Ріжемо ЛИШЕ по межах
+    рядків: кожен рядок самодостатній за розміткою, тож теги не розриваються.
+    Останній рядок (посилання на подію) зберігаємо завжди.
+    """
+    if len(message) <= limit:
+        return message
+    lines = message.split('\n')
+    tail = lines[-1]
+    marker = '<i>…повідомлення скорочено</i>'
+    used = len(tail) + len(marker) + 2
+    kept = []
+    for ln in lines[:-1]:
+        if used + len(ln) + 1 > limit:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return '\n'.join(kept + [marker, tail])
+
+
 def send_telegram(message):
+    message = clip_message(message)
     """Надсилає HTML-повідомлення. 429 — чекаємо і повторюємо; 400 (постійна
     помилка розмітки) — надсилаємо plain-text без розмітки, щоб сигнал не
     загубився; мережеві збої — ретраї з backoff."""
