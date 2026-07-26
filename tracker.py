@@ -95,6 +95,19 @@ STATE_HEARTBEAT_SECONDS = int(_clamp(_env_num('STATE_HEARTBEAT_MINUTES', 30, flo
 MIN_RUN_INTERVAL_SECONDS = int(_clamp(_env_num('MIN_RUN_INTERVAL_SECONDS', 45, float),
                                       0, 240, 'MIN_RUN_INTERVAL_SECONDS'))
 
+# Наскільки межа вікна відстає від «зараз» (сек).
+#
+# Обов'язково > 0. Часові мітки угод мають точність до СЕКУНДИ, а запит до API
+# відбувається вже після того, як ми зафіксували window_end. Якщо взяти
+# window_end = зараз, то угода, що сталася в ту саму секунду, але на частку
+# секунди пізніше за наш запит, у відповідь не потрапить — а наступний запуск
+# відкине її як стару (ts <= since). Вона зникає НАЗАВЖДИ.
+# Замір: ~0.2% часу «сліпі», тобто при порозі $10k це ~3 втрачені угоди на добу.
+# Відставання на кілька секунд закриває і це, і невелику затримку індексації
+# на боці API. Ціна — сповіщення пізніше на ці ж кілька секунд.
+WINDOW_LAG_SECONDS = int(_clamp(_env_num('WINDOW_LAG_SECONDS', 5, float),
+                                1, 120, 'WINDOW_LAG_SECONDS'))
+
 # Бюджет часу на вибірку угод (сек). Джоба вбивається таймаутом за 4 хв, і
 # смерть посеред вибірки — найгірший сценарій: сповіщення не надсилаються
 # взагалі, стан не зберігається, наступний запуск повторює те саме вікно і
@@ -552,7 +565,8 @@ def main():
     since = state['last_timestamp']
     stored_ts = state['stored_ts']
     positions = state['positions']
-    window_end = int(time.time())
+    # Межа вікна свідомо відстає від «зараз» — див. WINDOW_LAG_SECONDS.
+    window_end = int(time.time()) - WINDOW_LAG_SECONDS
     agg_cutoff = window_end - AGG_WINDOW_SECONDS
 
     # Дублюючий тригер (зовнішній планувальник + розклад GitHub + ручний
@@ -585,7 +599,7 @@ def main():
         print(f"Діапазон кандидатів: {format_time(oldest)} .. {format_time(newest)} "
               f"(це найновіші {len(trades)} купівель ≥ ${FILTER_AMOUNT:,.0f})")
         print(f"У вікні ({format_time(since)}..зараз): {in_window} · "
-              f"до вікна: {before} · у майбутньому (розсинхрон годинника): {future}")
+              f"до вікна: {before} · свіжіші за межу вікна (візьмемо наступного разу): {future}")
         print(f"Найбільша у вибірці: ${calc_usd(biggest):,.0f} о {format_time(trade_ts(biggest))}")
         if in_window == 0 and future == 0:
             print("→ У цьому вікні великих купівель не було (тихий період) — це нормально.")
