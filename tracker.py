@@ -108,6 +108,17 @@ MIN_RUN_INTERVAL_SECONDS = int(_clamp(_env_num('MIN_RUN_INTERVAL_SECONDS', 45, f
 WINDOW_LAG_SECONDS = int(_clamp(_env_num('WINDOW_LAG_SECONDS', 5, float),
                                 1, 120, 'WINDOW_LAG_SECONDS'))
 
+# Наскільки перечитувати НАЗАД за межу минулого запуску (сек).
+#
+# Відставання межі (вище) рятує від округлення до секунди, але не від затримки
+# індексації на боці API: якщо угода зʼявляється в /trades пізніше, ніж ми
+# зробили запит, наступний запуск відкине її як стару (ts <= since) — назавжди.
+# Тому щоразу перечитуємо ще трохи назад. Задвоєння це створити НЕ може: кожна
+# угода має uid, і вже враховані лежать у стані позиції — повторні просто
+# відсіюються. Коштує це нічого: та сама одна сторінка.
+RESCAN_OVERLAP_SECONDS = int(_clamp(_env_num('RESCAN_OVERLAP_SECONDS', 180, float),
+                                    0, 3600, 'RESCAN_OVERLAP_SECONDS'))
+
 # Бюджет часу на вибірку угод (сек). Джоба вбивається таймаутом за 4 хв, і
 # смерть посеред вибірки — найгірший сценарій: сповіщення не надсилаються
 # взагалі, стан не зберігається, наступний запуск повторює те саме вікно і
@@ -580,8 +591,12 @@ def main():
     print(f"Перевірка з {format_time(since)} · поріг сигналу ${MIN_AMOUNT:,.0f} · "
           f"шматок ≥ ${COMPONENT_MIN:,.0f} · вікно {AGG_WINDOW_SECONDS // 60} хв")
 
+    # Перечитуємо трохи назад за since — страховка від затримки індексації
+    # на боці API. Дублі неможливі: угоди дедуплікуються за uid.
+    scan_from = max(0, since - RESCAN_OVERLAP_SECONDS)
+
     try:
-        trades, complete = get_trades_since(since)
+        trades, complete = get_trades_since(scan_from)
     except Exception as e:
         print(f"❌ Помилка отримання угод: {e}. Стан не оновлюється, повторимо наступного разу.")
         return
@@ -593,12 +608,14 @@ def main():
         ts_all = [trade_ts(t) for t in trades]
         newest, oldest = max(ts_all), min(ts_all)
         in_window = sum(1 for ts in ts_all if since < ts <= window_end)
+        in_overlap = sum(1 for ts in ts_all if scan_from < ts <= since)
         future = sum(1 for ts in ts_all if ts > window_end)
         before = sum(1 for ts in ts_all if ts <= since)
         biggest = max(trades, key=calc_usd)
         print(f"Діапазон кандидатів: {format_time(oldest)} .. {format_time(newest)} "
               f"(це найновіші {len(trades)} купівель ≥ ${FILTER_AMOUNT:,.0f})")
         print(f"У вікні ({format_time(since)}..зараз): {in_window} · "
+              f"у перекритті (перечитано про запас): {in_overlap} · "
               f"до вікна: {before} · свіжіші за межу вікна (візьмемо наступного разу): {future}")
         print(f"Найбільша у вибірці: ${calc_usd(biggest):,.0f} о {format_time(trade_ts(biggest))}")
         if in_window == 0 and future == 0:
@@ -611,9 +628,9 @@ def main():
     # не витрачали зайвий запит. Якщо не вдалося — не біда: сповіщення
     # піде без мітки типу, а не зникне.
     taker_uids = None
-    if any(since < trade_ts(t) <= window_end for t in trades):
+    if any(scan_from < trade_ts(t) <= window_end for t in trades):
         try:
-            taker_trades, _tc = get_trades_since(since, taker_only=True)
+            taker_trades, _tc = get_trades_since(scan_from, taker_only=True)
             taker_uids = {trade_uid(t) for t in taker_trades}
             print(f"Тип угод визначено (ринкових у вибірці: {len(taker_uids)})")
         except Exception as e:
@@ -623,7 +640,7 @@ def main():
     added = 0
     for t in trades:
         ts = trade_ts(t)
-        if ts <= since or ts > window_end:
+        if ts <= scan_from or ts > window_end:
             continue
         if str(t.get('side', 'BUY')).upper() != 'BUY':
             continue
