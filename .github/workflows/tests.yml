@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'tracker.py'
+      - 'test_tracker.py'
+      - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      # Тести не ходять у мережу: API і Telegram підмінені, годинник керований.
+      - run: python test_tracker.py
