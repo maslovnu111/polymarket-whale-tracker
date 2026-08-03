@@ -55,8 +55,11 @@ jobs:
           MIN_AMOUNT: ${{ secrets.MIN_AMOUNT }}
           # Необов'язкові налаштування (Repo Settings -> Secrets and variables ->
           # Actions -> Variables). Порожні значення = дефолти з коду.
-          COMPONENT_MIN: ${{ vars.COMPONENT_MIN }}         # поріг шматка, $ (деф. 100000)
+          COMPONENT_MIN: ${{ vars.COMPONENT_MIN }}          # поріг шматка, $ (деф. 100000)
           AGG_WINDOW_MINUTES: ${{ vars.AGG_WINDOW_MINUTES }} # вікно агрегації, хв (деф. 60)
+          TRACK_SELLS: ${{ vars.TRACK_SELLS }}               # 0 = не стежити за продажами (деф. 1)
+          QUIET_NOTICE_HOURS: ${{ vars.QUIET_NOTICE_HOURS }} # «я живий» після стількох годин тиші (деф. 48)
+          ENABLE_COMMANDS: ${{ vars.ENABLE_COMMANDS }}       # 0 = не відповідати на команди (деф. 1)
         run: python tracker.py
 
       - name: Save state to repo
