@@ -58,7 +58,9 @@ jobs:
           COMPONENT_MIN: ${{ vars.COMPONENT_MIN }}          # поріг шматка, $ (деф. 100000)
           AGG_WINDOW_MINUTES: ${{ vars.AGG_WINDOW_MINUTES }} # вікно агрегації, хв (деф. 60)
           TRACK_SELLS: ${{ vars.TRACK_SELLS }}               # 0 = не стежити за продажами (деф. 1)
-          QUIET_NOTICE_HOURS: ${{ vars.QUIET_NOTICE_HOURS }} # «я живий» після стількох годин тиші (деф. 48)
+          DAILY_DIGEST: ${{ vars.DAILY_DIGEST }}             # 0 = без щоденного підсумку (деф. 1)
+          DAILY_DIGEST_HOUR: ${{ vars.DAILY_DIGEST_HOUR }}   # о котрій годині UTC слати підсумок (деф. 9)
+          DIGEST_TOP: ${{ vars.DIGEST_TOP }}                 # скільки угод у підсумку (деф. 3)
           ENABLE_COMMANDS: ${{ vars.ENABLE_COMMANDS }}       # 0 = не відповідати на команди (деф. 1)
         run: python tracker.py
 

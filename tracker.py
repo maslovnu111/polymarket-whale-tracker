@@ -85,11 +85,15 @@ FILTER_AMOUNT = max(1, int(COMPONENT_MIN * FILTER_MARGIN))
 TRACK_SELLS = str(os.environ.get('TRACK_SELLS', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
 SIDES = ('BUY', 'SELL') if TRACK_SELLS else ('BUY',)
 
-# Якщо сигналів немає довше за стільки годин — надсилаємо коротке «я живий»
-# зі статистикою. Інакше тиша на ринку не відрізняється від поламаного бота:
-# саме через це виникло питання «чому 6 днів немає сповіщень?».
-QUIET_NOTICE_SECONDS = int(_clamp(_env_num('QUIET_NOTICE_HOURS', 48, float),
-                                  1, 24 * 30, 'QUIET_NOTICE_HOURS') * 3600)
+# Щоденний підсумок: топ-3 найбільші угоди за добу. Раз на добу, о цій
+# годині UTC. Заразом показує, що бот живий — тиша на ринку інакше не
+# відрізняється від поламаного бота (саме через це виникло питання
+# «чому 6 днів немає сповіщень?»).
+DAILY_DIGEST = str(os.environ.get('DAILY_DIGEST', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+DAILY_DIGEST_HOUR = int(_clamp(_env_num('DAILY_DIGEST_HOUR', 9, float),
+                               0, 23, 'DAILY_DIGEST_HOUR'))
+# Скільки угод показувати у підсумку.
+DIGEST_TOP = int(_clamp(_env_num('DIGEST_TOP', 3, float), 1, 10, 'DIGEST_TOP'))
 # Чи відповідати на команди в Telegram (/status, /top, /help).
 ENABLE_COMMANDS = str(os.environ.get('ENABLE_COMMANDS', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
 
@@ -760,41 +764,76 @@ def handle_commands(meta, positions, trades, window_end, since):
     return handled
 
 
-def maybe_quiet_notice(meta, positions, trades, window_end, since):
-    """Якщо сигналів довго немає — коротке «я живий».
+def build_digest_message(trades, window_end):
+    """Щоденний підсумок: найбільші угоди за останні 24 години."""
+    day_ago = window_end - 86400
+    recent = [t for t in trades if day_ago < trade_ts(t) <= window_end]
+    date = datetime.fromtimestamp(window_end, tz=timezone.utc).strftime('%d.%m')
 
-    Без цього тиша на ринку невідрізненна від зламаного бота: саме так і
-    виникло питання «чому 6 днів немає сповіщень?». Замір: у спокійний
-    період позицій ≥ $1M буває 0 за тиждень — тиша тут норма, а не збій.
+    lines = [f"📅 <b>Підсумок доби · {date}</b>", ""]
+    if not recent:
+        lines.append(f"За 24 години не було жодної угоди ≥ ${COMPONENT_MIN:,.0f}.")
+        lines.append(f"\n⚙️ {describe_settings()}")
+        lines.append("<i>/status — подробиці, /top — позиції у вікні</i>")
+        return "\n".join(lines)
+
+    top = sorted(recent, key=calc_usd, reverse=True)[:DIGEST_TOP]
+    lines.append(f"🏆 <b>Найбільші угоди за 24 год:</b>")
+    for i, t in enumerate(top, 1):
+        usd = calc_usd(t)
+        is_sell = trade_side(t) == 'SELL'
+        price = float(t.get('price') or 0)
+        wallet = t.get('proxyWallet') or ''
+        name = (t.get('name') or t.get('pseudonym') or '').strip()
+        trader = esc(f"{name} ({short_wallet(wallet)})" if name
+                     else (short_wallet(wallet) or 'Анонім'))
+        slug = t.get('eventSlug') or t.get('slug') or ''
+        tx = str(t.get('transactionHash') or '')
+
+        head = (f"{i}. {'🔴' if is_sell else '🟢'} <b>${usd:,.0f}</b>"
+                f"{' · продаж' if is_sell else ''} · {price * 100:.0f}¢ · "
+                f"{format_time(trade_ts(t))}")
+        title = esc(str(t.get('title') or 'Ринок'))
+        if slug:
+            title = (f"<a href=\"{POLY_EVENT}/{quote(str(slug), safe='-_/')}\">"
+                     f"{title}</a>")
+        links = []
+        if wallet:
+            links.append(f"<a href=\"{POLY_PROFILE}/{quote(str(wallet), safe='')}\">"
+                         f"{trader}</a>")
+        else:
+            links.append(trader)
+        if tx:
+            links.append(f"<a href=\"{POLYGONSCAN_TX}/{quote(tx, safe='')}\">трейд</a>")
+
+        lines.append(head)
+        lines.append(f"    📌 {title} · 🎯 {esc(outcome_of(t))}")
+        lines.append(f"    👤 {' · '.join(links)}")
+
+    buys = [t for t in recent if trade_side(t) == 'BUY']
+    sells = [t for t in recent if trade_side(t) == 'SELL']
+    lines.append(f"\n📊 Усього угод ≥ ${COMPONENT_MIN:,.0f} за добу: <b>{len(recent)}</b> "
+                 f"({len(buys)} купівель, {len(sells)} продажів) · "
+                 f"обсяг ${sum(calc_usd(t) for t in recent):,.0f}")
+    lines.append("<i>/status — подробиці, /top — позиції у вікні</i>")
+    return "\n".join(lines)
+
+
+def maybe_daily_digest(meta, trades, window_end):
+    """Раз на добу (о DAILY_DIGEST_HOUR UTC) — підсумок із найбільшими угодами.
+
+    Прив'язка до КАЛЕНДАРНОЇ доби, а не до «24 години з минулого разу»:
+    інакше час підсумку щодня повзе вперед на тривалість запуску.
     """
-    last_alert_ts = float((meta.get('last_alert') or {}).get('ts') or 0)
-    last_notice_ts = float(meta.get('last_notice_ts') or 0)
-    anchor = max(last_alert_ts, last_notice_ts)
-    if anchor <= 0:
-        # Перший запуск зі станом нового формату — просто ставимо відлік.
-        meta['last_notice_ts'] = window_end
+    if not DAILY_DIGEST:
         return False
-    if (window_end - anchor) < QUIET_NOTICE_SECONDS:
+    now = datetime.fromtimestamp(window_end, tz=timezone.utc)
+    today = now.strftime('%Y-%m-%d')
+    if meta.get('last_digest_day') == today or now.hour < DAILY_DIGEST_HOUR:
         return False
-
-    quiet_h = (window_end - last_alert_ts) / 3600 if last_alert_ts else 0
-    best = max(trades, key=calc_usd, default=None)
-    top_pos = max(positions.values(), key=pos_total, default=None)
-    msg = [f"🟢 <b>Бот працює, ринок тихий</b>", "",
-           f"⚙️ {describe_settings()}"]
-    if quiet_h:
-        msg.append(f"🔕 Без сигналів {quiet_h / 24:.1f} діб — жодна позиція "
-                   f"не дотягла до ${MIN_AMOUNT:,.0f}")
-    if best is not None:
-        msg.append(f"📈 Найбільша угода у вибірці: ${calc_usd(best):,.0f} "
-                   f"({format_time(trade_ts(best))})")
-    if top_pos is not None:
-        msg.append(f"🏆 Найбільша позиція у вікні: ${pos_total(top_pos):,.0f} "
-                   f"({len(top_pos['trades'])} угод)")
-    msg.append("\n<i>/status — подробиці, /top — усі позиції у вікні</i>")
-    if send_telegram("\n".join(msg)):
-        meta['last_notice_ts'] = window_end
-        print("📨 Надіслано повідомлення «бот живий, ринок тихий»")
+    if send_telegram(build_digest_message(trades, window_end)):
+        meta['last_digest_day'] = today
+        print(f"📨 Надіслано підсумок доби за {today}")
         return True
     return False
 
@@ -1050,10 +1089,9 @@ def main():
     # «серцебиття». В усіх інших випадках файл не чіпаємо — тоді workflow не
     # робить коміт, а наступний запуск просто перечитає те саме вікно з того
     # самого last_timestamp і відновить позиції з угод.
-    # Якщо сигналів давно не було — коротке «я живий» (щоб тиша на ринку не
-    # виглядала як зламаний бот). Робимо ПІСЛЯ сигналів: якщо цього разу щось
-    # надіслали, повідомлення не потрібне.
-    notice = False if sent > 0 else maybe_quiet_notice(meta, positions, trades, window_end, since)
+    # Щоденний підсумок із найбільшими угодами за добу. Йде незалежно від
+    # сигналів: це не «я живий», а окремий регулярний зріз ринку.
+    digest_sent = maybe_daily_digest(meta, trades, window_end)
 
     # Команди з Telegram (/status, /top). Читаємо в кінці — щоб відповідь
     # містила вже актуальні позиції цього запуску.
@@ -1063,10 +1101,10 @@ def main():
     heartbeat_due = (window_end - stored_ts) >= STATE_HEARTBEAT_SECONDS
     # stale_alerts: чистка сталася лише в пам'яті — без запису файл лишався б
     # засміченим назавжди, і кожен запуск чистив би те саме наново.
-    # commands/notice: обидва пишуть у meta; без збереження бот відповів би на
-    # ту саму команду ще раз і слав би «я живий» щоп'ять хвилин.
+    # commands/digest: обидва пишуть у meta; без збереження бот відповів би на
+    # ту саму команду ще раз і слав би підсумок щоп'ять хвилин.
     must_save = ((stored_ts <= 0) or sent > 0 or has_alerted
-                 or heartbeat_due or stale_alerts > 0 or commands > 0 or notice)
+                 or heartbeat_due or stale_alerts > 0 or commands > 0 or digest_sent)
 
     if not complete:
         # Неповне покриття: не просуваємо межу вікна, наступний запуск доробить.
@@ -1077,7 +1115,7 @@ def main():
         save_state(window_end, positions, meta)
         why = ("сповіщення" if sent > 0 else
                "команда в Telegram" if commands else
-               "повідомлення про тишу" if notice else
+               "підсумок доби" if digest_sent else
                "є просигналені позиції" if has_alerted else
                "серцебиття" if heartbeat_due else
                "чистка застарілих позначок" if stale_alerts else "перший запуск")

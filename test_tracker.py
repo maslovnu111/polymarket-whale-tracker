@@ -64,7 +64,7 @@ def mk(ts, usd, wallet='0xwhale', asset='asset-yes', side='BUY',
     }
 
 
-def run(feed, now, state_file, taker_subset=None, with_notice=False,
+def run(feed, now, state_file, taker_subset=None, with_digest=False,
         commands=None, incomplete=False):
     """Один запуск бота на синтетичній стрічці. Повертає надіслані тексти."""
     tracker.STATE_FILE = state_file
@@ -83,10 +83,8 @@ def run(feed, now, state_file, taker_subset=None, with_notice=False,
 
     tracker.send_telegram = fake_send
     tracker.get_trades_since = fake_get
-    if not with_notice:
-        tracker.maybe_quiet_notice = lambda *a, **k: False
-    else:
-        tracker.maybe_quiet_notice = _real_notice
+    tracker.maybe_daily_digest = (_real_digest if with_digest
+                                  else (lambda *a, **k: False))
     tracker.handle_commands = (commands if commands is not None
                                else (lambda *a, **k: 0))
     try:
@@ -95,12 +93,12 @@ def run(feed, now, state_file, taker_subset=None, with_notice=False,
         tracker.time = _real_time
         tracker.send_telegram = _real_send
         tracker.get_trades_since = _real_get
-        tracker.maybe_quiet_notice = _real_notice
+        tracker.maybe_daily_digest = _real_digest
         tracker.handle_commands = _real_commands
     return sent
 
 
-_real_notice = tracker.maybe_quiet_notice
+_real_digest = tracker.maybe_daily_digest
 _real_commands = tracker.handle_commands
 _real_send = tracker.send_telegram
 _real_get = tracker.get_trades_since
@@ -378,7 +376,7 @@ def _():
     tracker.STATE_FILE = st
     tracker.time = FakeTime(NOW)
     tracker.send_telegram = lambda m: True
-    tracker.maybe_quiet_notice = lambda *a, **k: False
+    tracker.maybe_daily_digest = lambda *a, **k: False
     tracker.handle_commands = lambda *a, **k: 0
 
     def boom(since, taker_only=False, side='BUY'):
@@ -389,7 +387,7 @@ def _():
         tracker.main()
     finally:
         tracker.time = _real_time
-        tracker.maybe_quiet_notice = _real_notice
+        tracker.maybe_daily_digest = _real_digest
         tracker.handle_commands = _real_commands
     check("файл стану не створено", not os.path.exists(st))
 
@@ -495,19 +493,56 @@ def _():
     check("посилання на подію збережено", sent and 'Відкрити подію' in sent[0])
 
 
-@case("29. Повідомлення «бот живий», коли ринок тихий")
+@case("29. Щоденний підсумок: топ-3 угоди за добу")
 def _():
     st = fresh_state()
-    # 1) є свіжий сигнал -> повідомлення про тишу не потрібне
-    run([mk(NOW - 600, 1_200_000)], NOW, st)
-    later = NOW + tracker.QUIET_NOTICE_SECONDS + 600
-    s_quiet = run([mk(NOW - 600, 90_000, tx='0xq')], later, st, with_notice=True)
-    check("після довгої тиші надіслано «я живий»", len(s_quiet) == 1, s_quiet)
-    check("текст про роботу", s_quiet and 'ринок тихий' in s_quiet[0],
-          s_quiet[0][:120] if s_quiet else '')
-    # 2) одразу після цього — не повторюється
-    s_again = run([mk(NOW - 600, 90_000, tx='0xq')], later + 300, st, with_notice=True)
-    check("не повторюється щоп'ять хвилин", len(s_again) == 0, s_again)
+    # DAILY_DIGEST_HOUR = 9 UTC; беремо момент після цієї години
+    base = 1_800_000_000
+    day = base - base % 86400 + 10 * 3600            # 10:00 UTC
+    feed = [
+        mk(day - 3600, 900_000, tx='0xd1', title='Найбільша подія', outcome='Yes'),
+        mk(day - 7200, 600_000, tx='0xd2', title='Друга подія', side='SELL'),
+        mk(day - 10800, 300_000, tx='0xd3', title='Третя подія'),
+        mk(day - 14400, 100_000, tx='0xd4', title='Четверта подія'),
+        mk(day - 200_000, 5_000_000, tx='0xd5', title='Позавчора — не рахується'),
+    ]
+    sent = run(feed, day, st, with_digest=True)
+    check("підсумок надіслано", len(sent) == 1, len(sent))
+    msg = sent[0] if sent else ''
+    check("це підсумок доби", 'Підсумок доби' in msg, msg[:80])
+    check("топ-1 є", '$900,000' in msg, msg[:400])
+    check("топ-2 є", '$600,000' in msg)
+    check("топ-3 є", '$300,000' in msg)
+    check("четверта НЕ показана", '$100,000' not in msg)
+    check("старіша за добу НЕ показана", '5,000,000' not in msg, msg[:400])
+    check("продаж помічено", 'продаж' in msg)
+    check("є лічильник за добу", 'Усього угод' in msg)
+    check("є посилання на подію", 'polymarket.com/event' in msg)
+    check("є посилання на трейд", 'polygonscan.com/tx' in msg)
+
+    # вдруге того самого дня — не повторюється
+    again = run(feed, day + 300, st, with_digest=True)
+    check("вдруге за день не шле", len(again) == 0, again)
+    # наступної доби — знову
+    nxt = run([mk(day + 86400 - 600, 700_000, tx='0xd6')], day + 86400, st,
+              with_digest=True)
+    check("наступної доби шле знову", len(nxt) == 1, nxt)
+
+
+@case("29б. Підсумок не йде до призначеної години і працює на порожній добі")
+def _():
+    st = fresh_state()
+    base = 1_800_000_000
+    early = base - base % 86400 + 3 * 3600           # 03:00 UTC < 9:00
+    check("о 03:00 підсумку немає",
+          len(run([mk(early - 600, 900_000, tx='0xe9')], early, st,
+                  with_digest=True)) == 0)
+    st2 = fresh_state()
+    day = base - base % 86400 + 10 * 3600
+    sent = run([mk(day - 200_000, 900_000, tx='0xe8')], day, st2, with_digest=True)
+    check("порожня доба -> підсумок усе одно є", len(sent) == 1, len(sent))
+    check("сказано, що угод не було",
+          sent and 'не було жодної угоди' in sent[0], sent[0][:120] if sent else '')
 
 
 @case("30. Команди Telegram: /status, /top, /help")
