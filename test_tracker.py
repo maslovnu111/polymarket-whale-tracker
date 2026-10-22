@@ -64,8 +64,13 @@ def mk(ts, usd, wallet='0xwhale', asset='asset-yes', side='BUY',
     }
 
 
-def run(feed, now, state_file, taker_subset=None, with_digest=False,
-        commands=None, incomplete=False):
+_real_commands = tracker.handle_commands
+_real_send = tracker.send_telegram
+_real_get = tracker.get_trades_since
+
+
+def run(feed, now, state_file, taker_subset=None, commands=None,
+        incomplete=False):
     """Один запуск бота на синтетичній стрічці. Повертає надіслані тексти."""
     tracker.STATE_FILE = state_file
     tracker.time = FakeTime(now)
@@ -83,8 +88,6 @@ def run(feed, now, state_file, taker_subset=None, with_digest=False,
 
     tracker.send_telegram = fake_send
     tracker.get_trades_since = fake_get
-    tracker.maybe_daily_digest = (_real_digest if with_digest
-                                  else (lambda *a, **k: False))
     tracker.handle_commands = (commands if commands is not None
                                else (lambda *a, **k: 0))
     try:
@@ -93,15 +96,8 @@ def run(feed, now, state_file, taker_subset=None, with_digest=False,
         tracker.time = _real_time
         tracker.send_telegram = _real_send
         tracker.get_trades_since = _real_get
-        tracker.maybe_daily_digest = _real_digest
         tracker.handle_commands = _real_commands
     return sent
-
-
-_real_digest = tracker.maybe_daily_digest
-_real_commands = tracker.handle_commands
-_real_send = tracker.send_telegram
-_real_get = tracker.get_trades_since
 
 
 def fresh_state():
@@ -376,7 +372,6 @@ def _():
     tracker.STATE_FILE = st
     tracker.time = FakeTime(NOW)
     tracker.send_telegram = lambda m: True
-    tracker.maybe_daily_digest = lambda *a, **k: False
     tracker.handle_commands = lambda *a, **k: 0
 
     def boom(since, taker_only=False, side='BUY'):
@@ -387,7 +382,8 @@ def _():
         tracker.main()
     finally:
         tracker.time = _real_time
-        tracker.maybe_daily_digest = _real_digest
+        tracker.send_telegram = _real_send
+        tracker.get_trades_since = _real_get
         tracker.handle_commands = _real_commands
     check("файл стану не створено", not os.path.exists(st))
 
@@ -493,59 +489,7 @@ def _():
     check("посилання на подію збережено", sent and 'Відкрити подію' in sent[0])
 
 
-@case("29. Щоденний підсумок: топ-3 угоди за добу")
-def _():
-    st = fresh_state()
-    # DAILY_DIGEST_HOUR = 9 UTC; беремо момент після цієї години
-    base = 1_800_000_000
-    day = base - base % 86400 + 10 * 3600            # 10:00 UTC
-    feed = [
-        mk(day - 3600, 900_000, tx='0xd1', title='Найбільша подія', outcome='Yes'),
-        mk(day - 7200, 600_000, tx='0xd2', title='Друга подія', side='SELL'),
-        mk(day - 10800, 300_000, tx='0xd3', title='Третя подія'),
-        mk(day - 14400, 100_000, tx='0xd4', title='Четверта подія'),
-        mk(day - 200_000, 5_000_000, tx='0xd5', title='Позавчора — не рахується'),
-    ]
-    sent = run(feed, day, st, with_digest=True)
-    check("підсумок надіслано", len(sent) == 1, len(sent))
-    msg = sent[0] if sent else ''
-    check("це підсумок доби", 'Підсумок доби' in msg, msg[:80])
-    check("топ-1 є", '$900,000' in msg, msg[:400])
-    check("топ-2 є", '$600,000' in msg)
-    check("топ-3 є", '$300,000' in msg)
-    check("четверта НЕ показана", '$100,000' not in msg)
-    check("старіша за добу НЕ показана", '5,000,000' not in msg, msg[:400])
-    check("продаж помічено", 'продаж' in msg)
-    check("є лічильник за добу", 'Усього угод' in msg)
-    check("є посилання на подію", 'polymarket.com/event' in msg)
-    check("є посилання на трейд", 'polygonscan.com/tx' in msg)
-
-    # вдруге того самого дня — не повторюється
-    again = run(feed, day + 300, st, with_digest=True)
-    check("вдруге за день не шле", len(again) == 0, again)
-    # наступної доби — знову
-    nxt = run([mk(day + 86400 - 600, 700_000, tx='0xd6')], day + 86400, st,
-              with_digest=True)
-    check("наступної доби шле знову", len(nxt) == 1, nxt)
-
-
-@case("29б. Підсумок не йде до призначеної години і працює на порожній добі")
-def _():
-    st = fresh_state()
-    base = 1_800_000_000
-    early = base - base % 86400 + 3 * 3600           # 03:00 UTC < 9:00
-    check("о 03:00 підсумку немає",
-          len(run([mk(early - 600, 900_000, tx='0xe9')], early, st,
-                  with_digest=True)) == 0)
-    st2 = fresh_state()
-    day = base - base % 86400 + 10 * 3600
-    sent = run([mk(day - 200_000, 900_000, tx='0xe8')], day, st2, with_digest=True)
-    check("порожня доба -> підсумок усе одно є", len(sent) == 1, len(sent))
-    check("сказано, що угод не було",
-          sent and 'не було жодної угоди' in sent[0], sent[0][:120] if sent else '')
-
-
-@case("30. Команди Telegram: /status, /top, /help")
+@case("29. Команди Telegram: /status, /top, /help")
 def _():
     st = fresh_state()
     run([mk(NOW - 600, 1_200_000)], NOW, st)
@@ -579,7 +523,7 @@ def _():
     check("offset просунуто", meta.get('tg_offset') == 6, meta.get('tg_offset'))
 
 
-@case("31. /top і /status не падають на порожньому стані")
+@case("30. /top і /status не падають на порожньому стані")
 def _():
     top = tracker.build_top_message({}, NOW)
     status = tracker.build_status_message({}, [], {}, NOW, NOW - 300)
@@ -588,7 +532,7 @@ def _():
     check("/status без сигналів", 'ще не було' in status)
 
 
-@case("32. Купівлі і продажі не заважають одна одній в одному запуску")
+@case("31. Купівлі і продажі не заважають одна одній в одному запуску")
 def _():
     st = fresh_state()
     feed = [mk(NOW - 600, 1_200_000, wallet='0xbuyer', asset='yes', side='BUY'),
@@ -600,7 +544,7 @@ def _():
     check("є сигнал про вихід", 'скидає' in joined)
 
 
-@case("33. Дублюючий тригер одразу після збереження -> миттєвий вихід")
+@case("32. Дублюючий тригер одразу після збереження -> миттєвий вихід")
 def _():
     st = fresh_state()
     run([mk(NOW - 600, 1_200_000)], NOW, st)
@@ -611,7 +555,7 @@ def _():
     check("стан не змінився", json.load(open(st))['last_timestamp'] == saved)
 
 
-@case("34. Позиція вийшла з вікна, кит зайшов знову -> новий сигнал")
+@case("33. Позиція вийшла з вікна, кит зайшов знову -> новий сигнал")
 def _():
     st = fresh_state()
     s1 = run([mk(NOW - 600, 1_200_000, tx='0xr1')], NOW, st)
@@ -622,8 +566,7 @@ def _():
     check("другий сигнал після нового заходу", len(s2) == 1, s2)
 
 
-
-@case("35. Наздоганяння після простою: старі угоди не сумуються у одне вікно")
+@case("34. Наздоганяння після простою: старі угоди не сумуються у одне вікно")
 def _():
     st = fresh_state()
     # бот стояв 3 години; за цей час кит купував по $400k раз на годину
@@ -639,7 +582,7 @@ def _():
           [len(p['trades']) for p in pos])
 
 
-@case("36. Кит повернувся у ТОЙ САМИЙ ринок після паузи -> сигнал знову")
+@case("35. Кит повернувся у ТОЙ САМИЙ ринок після паузи -> сигнал знову")
 def _():
     st = fresh_state()
     s1 = run([mk(NOW - 600, 1_200_000, tx='0xh1')], NOW, st)
@@ -656,35 +599,4 @@ print("=" * 70)
 print(f"Провалено: {len(_failures)}")
 for f in _failures:
     print(f"  - {f}")
-
-@case("35. Наздоганяння після простою: старі угоди не сумуються у одне вікно")
-def _():
-    st = fresh_state()
-    # бот стояв 3 години; за цей час кит купував по $400k раз на годину
-    json.dump({'last_timestamp': NOW - 3 * 3600, 'positions': {}, 'meta': {}},
-              open(st, 'w'))
-    feed = [mk(NOW - 3 * 3600 + 60, 400_000, tx='0xg1'),
-            mk(NOW - 2 * 3600 + 60, 400_000, tx='0xg2'),
-            mk(NOW - 600, 400_000, tx='0xg3')]
-    sent = run(feed, NOW, st)
-    check("три години НЕ склались у одну позицію", len(sent) == 0, sent)
-    pos = list(json.load(open(st))['positions'].values())
-    check("у вікні лишилась одна угода", pos and len(pos[0]['trades']) == 1,
-          [len(p['trades']) for p in pos])
-
-
-@case("36. Кит повернувся у ТОЙ САМИЙ ринок після паузи -> сигнал знову")
-def _():
-    st = fresh_state()
-    s1 = run([mk(NOW - 600, 1_200_000, tx='0xh1')], NOW, st)
-    mid = NOW + 2 * WIN
-    s2 = run([mk(mid - 600, 1_300_000, tx='0xh2')], mid, st)
-    late = mid + 2 * WIN
-    s3 = run([mk(late - 600, 1_100_000, tx='0xh3')], late, st)
-    check("сигнал 1", len(s1) == 1, s1)
-    check("сигнал 2 (позиція встигла вийти з вікна)", len(s2) == 1, s2)
-    check("сигнал 3", len(s3) == 1, s3)
-
-
-print("=" * 70)
 sys.exit(1 if _failures else 0)
